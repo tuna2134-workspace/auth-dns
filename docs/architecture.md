@@ -83,7 +83,8 @@
   （RFC 4035 §2.2: RRSIG は通常の RRset ではない）。
 - TTL は RRset の先頭を採用。異なる TTL は警告。
 - 完全一致用の `index: owner -> []RRset index`、存在名（ENT 含む）の `names`、
-  委任点の `delegations`、NSEC の canonical 順索引 `nsec_names` を構築。
+  委任点の `delegations`、NSEC の canonical 順索引 `nsec_names`、
+  NSEC3 の hashed owner 索引 `nsec3_names` / `nsec3_params` を構築。
 - 構築後は不変。クエリはロックなしで読める（サーバ側で RwLock によりリロードと排他）。
 
 ### クエリ処理 (`src/server/query.zig`)
@@ -141,6 +142,32 @@
   - 各 RR: owner_len u8, owner, type u16, class u16, ttl u32, rdlen u16, rdata
 - 再起動時に読み込み、最後の `to_serial` が現在のゾーンと一致しなければ破棄。
 
+### セカンダリ (`src/server/secondary.zig`)
+
+- プライマリへ TCP で IXFR（初回は AXFR）を要求。
+- 応答メッセージを解析し、RDATA 内の圧縮名を非圧縮の正規形に直して
+  `Zone.build` で不変 Zone を構築。
+- IXFR は「現在 SOA → 旧 SOA → 削除 → 新 SOA → 追加」の列として適用し、
+  最後に新しい SOA を置く。
+- `refresh` 間隔で SOA を確認し、NOTIFY 受信時は即時リフレッシュ。
+- 取得したゾーンはマスターファイルに書き戻し、再起動時に再利用。
+
+### Dynamic Update (`src/server/update.zig`)
+
+- RFC 2136 の prerequisite（yxdomain/nxdomain/yxrrset/nxrrset/値依存）と
+  update（add/delete/delete-RRset/delete-name）を実装。
+- 更新対象は不変 Zone をフラット化したレコード列。適用後に SOA シリアルを進め、
+  一時ファイルへ書き出して `sema.load` で再検証・再署名する。
+- 成功時は `journal.diff` で差分をジャーナルへ追加し、ゾーンファイルを
+  アトミックに置き換え、`also-notify` へ NOTIFY を送る。
+- 更新は排他ロックで直列化。
+
+### レート制限 (`src/server/ratelimit.zig`)
+
+- 送信元 IP ごとのトークンバケット。`qps` と `burst` を設定。
+- テーブルが上限を超えたら全消去してメモリを制限。
+- UDP はドロップ、TCP は接続を閉じる。
+
 ### サーバ (`src/server/server.zig`)
 
 - 起動時に設定の各ゾーンを `sema.load` で読み込む。
@@ -153,6 +180,10 @@
   - SIGHUP リロードは排他ロック。
 - SIGHUP:
   - 1 秒ごとにフラグを確認し、ゾーンを再読み込み。
+- 1 秒ごとにセカンダリの refresh 期限を確認し、AXFR/IXFR を実行。
+- NOTIFY（opcode 4）は `allow-notify` ACL を確認して refresh を起動。
+  プライマリは `also-notify` へ NOTIFY を送信。
+- Dynamic Update（opcode 5）は `allow-update` ACL を確認して適用。
   - シリアルが増えていれば差分をジャーナルに追加して保存。
   - 同一シリアルで内容が変わった場合はジャーナルを破棄（IXFR で表現不能）。
 
@@ -171,7 +202,8 @@
   - RSA は PKCS#1 v1.5。
 - `signZone`:
   - DNSKEY（KSK 257 + ZSK 256、同じ公開鍵）を追加。
-  - 権威名の NSEC チェーンを構築（ENT には NSEC を作らない）。
+  - 通常は NSEC チェーン（ENT には NSEC を作らない）。
+  - `nsec3` 指定時は NSEC3PARAM + NSEC3 チェーン（ENT もハッシュ化、bitmap は空）。
   - 各 RRset の canonical データを作り RRSIG を生成。
   - 委任点の NS は署名しない（親側は DS と NSEC のみ）。
 - DS 生成は `ds` サブコマンドで行い、親ゾーンに登録できる。

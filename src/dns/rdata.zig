@@ -729,9 +729,11 @@ pub fn toText(
         },
         types.AAAA => {
             if (rdata.len != 16) return error.InvalidRdata;
-            var addr: std.Io.net.Ip6Address = undefined;
-            @memcpy(&addr.bytes, rdata);
-            try writer.print("{f}", .{addr});
+            for (0..8) |i| {
+                if (i != 0) try writer.writeByte(':');
+                const v = (@as(u16, rdata[i * 2]) << 8) | rdata[i * 2 + 1];
+                try writer.print("{x}", .{v});
+            }
         },
         types.NS, types.CNAME, types.PTR, types.DNAME => {
             var n: name.Name = undefined;

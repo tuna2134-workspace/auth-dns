@@ -16,6 +16,7 @@ const text = @import("../dns/text.zig");
 const rdata = @import("../dns/rdata.zig");
 const zone = @import("../zone/zone.zig");
 const openssl = @import("openssl.zig");
+const nsec3 = @import("../dns/nsec3.zig");
 
 extern fn time(t: ?*c_long) c_long;
 
@@ -31,6 +32,8 @@ pub const Options = struct {
     /// negative-cache TTL respectively.
     dnskey_ttl: ?u32 = null,
     nsec_ttl: ?u32 = null,
+    /// When set, generate an NSEC3 chain instead of NSEC.
+    nsec3: ?nsec3.Params = null,
 };
 
 /// Adds DNSKEY, NSEC and RRSIG records to `z` and returns the complete record
@@ -97,7 +100,7 @@ pub fn signZone(
         });
     }
 
-    // 3. NSEC chain over authoritative names.
+    // 3. NSEC or NSEC3 denial chain over authoritative names.
     var nameset: std.StringHashMapUnmanaged(void) = .{};
     defer nameset.deinit(allocator);
     for (z.allRRsets()) |*rs| {
@@ -114,36 +117,133 @@ pub fn signZone(
     defer allocator.free(sorted);
     std.mem.sort([]const u8, sorted, {}, nameLess);
 
-    var nsec_records: std.ArrayList(zone.Record) = .empty;
-    defer nsec_records.deinit(allocator);
-    for (sorted, 0..) |owner, i| {
-        const next = sorted[(i + 1) % sorted.len];
-        var rd: std.ArrayList(u8) = .empty;
-        defer rd.deinit(allocator);
-        try rd.appendSlice(allocator, next);
-        var tlist: std.ArrayList(u16) = .empty;
-        defer tlist.deinit(allocator);
-        for (z.rrsetsAt(owner)) |idx| {
-            const rs = &z.rrsets[idx];
-            if (!isAuthoritativeRRset(z, owner, rs.rtype)) continue;
-            if (isDelegationOwner(z, owner) and rs.rtype != types.NS and rs.rtype != types.DS) continue;
-            try tlist.append(allocator, rs.rtype);
-        }
-        try tlist.append(allocator, types.RRSIG);
-        try tlist.append(allocator, types.NSEC);
-        if (std.mem.eql(u8, owner, z.origin_wire)) try tlist.append(allocator, types.DNSKEY);
-        try rdata.encodeTypeBitmap(&rd, allocator, tlist.items);
-        try nsec_records.append(allocator, .{
-            .owner = owner,
-            .rtype = types.NSEC,
+    if (opts.nsec3) |params| {
+        var entries: std.ArrayList(Nsec3Entry) = .empty;
+        defer entries.deinit(allocator);
+        var nsec3_records: std.ArrayList(zone.Record) = .empty;
+        defer nsec3_records.deinit(allocator);
+        var param_records: std.ArrayList(zone.Record) = .empty;
+        defer param_records.deinit(allocator);
+
+        var param_rdata: std.ArrayList(u8) = .empty;
+        defer param_rdata.deinit(allocator);
+        try param_rdata.append(allocator, 1);
+        try param_rdata.append(allocator, params.flags);
+        try appendU16(&param_rdata, allocator, params.iterations);
+        if (params.salt.len > 255) return error.InvalidSoa;
+        try param_rdata.append(allocator, @intCast(params.salt.len));
+        try param_rdata.appendSlice(allocator, params.salt);
+        const p_rec: zone.Record = .{
+            .owner = z.origin_wire,
+            .rtype = types.NSEC3PARAM,
             .class = z.class,
             .ttl = nsec_ttl,
-            .rdata = try rd.toOwnedSlice(allocator),
-        });
-        try out.append(allocator, nsec_records.items[nsec_records.items.len - 1]);
+            .rdata = try param_rdata.toOwnedSlice(allocator),
+        };
+        try param_records.append(allocator, p_rec);
+        try out.append(allocator, p_rec);
+
+        var n3owners: std.ArrayList([]const u8) = .empty;
+        defer n3owners.deinit(allocator);
+        var nit = z.names.iterator();
+        while (nit.next()) |mentry| {
+            const nm = mentry.key_ptr.*;
+            if (z.findDelegation(nm)) |deleg| {
+                if (!std.mem.eql(u8, nm, deleg)) continue;
+            }
+            try n3owners.append(allocator, nm);
+        }
+        const n3sorted = try n3owners.toOwnedSlice(allocator);
+        defer allocator.free(n3sorted);
+        std.mem.sort([]const u8, n3sorted, {}, nameLess);
+
+        for (n3sorted) |owner| {
+            var h: [nsec3.hash_len]u8 = undefined;
+            try nsec3.hashName(owner, params, &h);
+            var hname: name.Name = undefined;
+            const ho = try nsec3.makeOwner(&h, z.origin_wire, &hname);
+            try entries.append(allocator, .{
+                .original = owner,
+                .hashed_owner = try allocator.dupe(u8, ho),
+                .hash = h,
+            });
+        }
+        std.mem.sort(Nsec3Entry, entries.items, {}, nsec3EntryLess);
+
+        for (entries.items, 0..) |*e, i| {
+            const next = entries.items[(i + 1) % entries.items.len].hash;
+            var rd: std.ArrayList(u8) = .empty;
+            defer rd.deinit(allocator);
+            try rd.append(allocator, 1);
+            try rd.append(allocator, params.flags);
+            try appendU16(&rd, allocator, params.iterations);
+            try rd.append(allocator, @intCast(params.salt.len));
+            try rd.appendSlice(allocator, params.salt);
+            try rd.append(allocator, nsec3.hash_len);
+            try rd.appendSlice(allocator, &next);
+            var tlist: std.ArrayList(u16) = .empty;
+            defer tlist.deinit(allocator);
+            try nsec3Types(z, e.original, &tlist, allocator);
+            try rdata.encodeTypeBitmap(&rd, allocator, tlist.items);
+            const rec: zone.Record = .{
+                .owner = e.hashed_owner,
+                .rtype = types.NSEC3,
+                .class = z.class,
+                .ttl = nsec_ttl,
+                .rdata = try rd.toOwnedSlice(allocator),
+            };
+            try nsec3_records.append(allocator, rec);
+            try out.append(allocator, rec);
+        }
+
+        for (nsec3_records.items) |*nr| {
+            const rdatas = [_][]const u8{nr.rdata};
+            const sig = try makeRrsig(allocator, z, nr.owner, types.NSEC3, nr.ttl, &rdatas, key, zsk_tag, inception, expiration);
+            try out.append(allocator, sig);
+        }
+        for (param_records.items) |*pr| {
+            const rdatas = [_][]const u8{pr.rdata};
+            const sig = try makeRrsig(allocator, z, pr.owner, types.NSEC3PARAM, pr.ttl, &rdatas, key, zsk_tag, inception, expiration);
+            try out.append(allocator, sig);
+        }
+    } else {
+        var nsec_records: std.ArrayList(zone.Record) = .empty;
+        defer nsec_records.deinit(allocator);
+        for (sorted, 0..) |owner, i| {
+            const next = sorted[(i + 1) % sorted.len];
+            var rd: std.ArrayList(u8) = .empty;
+            defer rd.deinit(allocator);
+            try rd.appendSlice(allocator, next);
+            var tlist: std.ArrayList(u16) = .empty;
+            defer tlist.deinit(allocator);
+            for (z.rrsetsAt(owner)) |idx| {
+                const rs = &z.rrsets[idx];
+                if (!isAuthoritativeRRset(z, owner, rs.rtype)) continue;
+                if (isDelegationOwner(z, owner) and rs.rtype != types.NS and rs.rtype != types.DS) continue;
+                try tlist.append(allocator, rs.rtype);
+            }
+            try tlist.append(allocator, types.RRSIG);
+            try tlist.append(allocator, types.NSEC);
+            if (std.mem.eql(u8, owner, z.origin_wire)) try tlist.append(allocator, types.DNSKEY);
+            try rdata.encodeTypeBitmap(&rd, allocator, tlist.items);
+            try nsec_records.append(allocator, .{
+                .owner = owner,
+                .rtype = types.NSEC,
+                .class = z.class,
+                .ttl = nsec_ttl,
+                .rdata = try rd.toOwnedSlice(allocator),
+            });
+            try out.append(allocator, nsec_records.items[nsec_records.items.len - 1]);
+        }
+
+        for (nsec_records.items) |*nr| {
+            const rdatas = [_][]const u8{nr.rdata};
+            const sig = try makeRrsig(allocator, z, nr.owner, types.NSEC, nr.ttl, &rdatas, key, zsk_tag, inception, expiration);
+            try out.append(allocator, sig);
+        }
     }
 
-    // 4. Sign every authoritative RRset, including DNSKEY and NSEC.
+    // 4. Sign every authoritative RRset, including DNSKEY.
     for (z.allRRsets()) |*rs| {
         if (!isSignableRRset(z, rs.owner, rs.rtype)) continue;
         const sig = try makeRrsig(allocator, z, rs.owner, rs.rtype, rs.ttl, rs.rdata, key, zsk_tag, inception, expiration);
@@ -156,14 +256,50 @@ pub fn signZone(
         const sig = try makeRrsig(allocator, z, z.origin_wire, types.DNSKEY, dnskey_ttl, rdatas[0..n], key, ksk_tag, inception, expiration);
         try out.append(allocator, sig);
     }
-    // NSEC RRsets.
-    for (nsec_records.items) |*nr| {
-        const rdatas = [_][]const u8{nr.rdata};
-        const sig = try makeRrsig(allocator, z, nr.owner, types.NSEC, nr.ttl, &rdatas, key, zsk_tag, inception, expiration);
-        try out.append(allocator, sig);
-    }
 
     return out.toOwnedSlice(allocator);
+}
+
+const Nsec3Entry = struct {
+    original: []const u8,
+    hashed_owner: []const u8,
+    hash: [nsec3.hash_len]u8,
+};
+
+fn nsec3EntryLess(_: void, a: Nsec3Entry, b: Nsec3Entry) bool {
+    return std.mem.order(u8, &a.hash, &b.hash) == .lt;
+}
+
+fn nsec3Types(z: *const zone.Zone, owner: []const u8, tlist: *std.ArrayList(u16), allocator: std.mem.Allocator) !void {
+    const deleg = isDelegationOwner(z, owner);
+    var any = false;
+    var has_ds = false;
+    for (z.rrsetsAt(owner)) |idx| {
+        const rs = &z.rrsets[idx];
+        if (!isAuthoritativeRRset(z, owner, rs.rtype)) continue;
+        if (deleg and rs.rtype != types.NS and rs.rtype != types.DS) continue;
+        try tlist.append(allocator, rs.rtype);
+        any = true;
+        if (rs.rtype == types.DS) has_ds = true;
+    }
+    // Empty non-terminals have an NSEC3 with an empty type bitmap.  NSEC3 is
+    // not a type at the original owner, so it must not appear here.
+    if (!any) return;
+    if (deleg) {
+        // The parent signs DS, not the delegation NS RRset.
+        if (has_ds) try tlist.append(allocator, types.RRSIG);
+        return;
+    }
+    try tlist.append(allocator, types.RRSIG);
+    if (std.mem.eql(u8, owner, z.origin_wire)) {
+        try tlist.append(allocator, types.DNSKEY);
+        try tlist.append(allocator, types.NSEC3PARAM);
+    }
+}
+
+fn appendU16(out: *std.ArrayList(u8), allocator: std.mem.Allocator, v: u16) !void {
+    try out.append(allocator, @intCast(v >> 8));
+    try out.append(allocator, @intCast(v & 0xff));
 }
 
 fn nameLess(_: void, a: []const u8, b: []const u8) bool {

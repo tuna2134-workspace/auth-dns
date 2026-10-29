@@ -11,6 +11,7 @@ pub const rdata = @import("dns/rdata.zig");
 pub const message = @import("dns/message.zig");
 pub const edns = @import("dns/edns.zig");
 pub const tsig = @import("dns/tsig.zig");
+pub const nsec3 = @import("dns/nsec3.zig");
 pub const lexer = @import("zone/lexer.zig");
 pub const ast = @import("zone/ast.zig");
 pub const parser = @import("zone/parser.zig");
@@ -23,7 +24,9 @@ pub const dnssec_sign = @import("dnssec/sign.zig");
 pub const queryset = @import("server/queryset.zig");
 pub const query = @import("server/query.zig");
 pub const acl = @import("server/acl.zig");
+pub const ratelimit = @import("server/ratelimit.zig");
 pub const server = @import("server/server.zig");
+pub const secondary = @import("server/secondary.zig");
 pub const config = @import("server/config.zig");
 
 test {
@@ -34,6 +37,7 @@ test {
     _ = message;
     _ = edns;
     _ = tsig;
+    _ = nsec3;
     _ = lexer;
     _ = ast;
     _ = parser;
@@ -46,6 +50,8 @@ test {
     _ = queryset;
     _ = query;
     _ = acl;
+    _ = ratelimit;
     _ = server;
+    _ = secondary;
     _ = config;
 }

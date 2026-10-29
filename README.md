@@ -21,10 +21,18 @@ UDP/TCP の権威応答、AXFR/IXFR、EDNS(0)、TSIG、NSEC を用いた DNSSEC 
 - **コンパイラ型のパイプライン**
   - `lexer -> parser -> AST -> 意味解析 -> 不変 Zone`。
     パーサは構文だけを扱い、`$ORIGIN`/`$TTL`/相対名解決は意味解析が行います。
-- **AXFR / IXFR**
+- **AXFR / IXFR / セカンダリ**
   - TCP 上の複数メッセージ転送。AXFR は先頭と末尾が同一 SOA。
   - IXFR はメモリ内ジャーナル＋ディスク永続化。SIGHUP リロードで差分を生成。
   - TSIG 使用時は各メッセージに署名し、AXFR の MAC 連鎖（RFC 8945）に対応。
+  - セカンダリモード（AXFR/IXFR クライアント、SOA refresh、NOTIFY 受信・送信）。
+- **Dynamic Update（RFC 2136）**
+  - prerequisite / add / delete / delete-RRset / delete-name、TSIG/ACL に対応。
+  - 更新後に SOA シリアルを進め、ジャーナル・ゾーンファイル・DNSSEC 署名を更新。
+- **NSEC3**
+  - NSEC3PARAM / NSEC3 の生成、ハッシュチェーン、NODATA/NXDOMAIN/ワイルドカードの否定証明。
+- **SVCB / HTTPS**
+  - `alpn` / `port` / `ipv4hint` / `ipv6hint` / `ech` / `dohpath` / `mandatory` / `no-default-alpn`。
 - **DNSSEC（オフライン署名）**
   - ECDSA P-256/P-384、Ed25519、RSA/SHA-256（アルゴリズム 13/14/15/8）。
   - DNSKEY（KSK+ZSK）、RRSIG、NSEC チェーン、DS 生成。
@@ -32,6 +40,9 @@ UDP/TCP の権威応答、AXFR/IXFR、EDNS(0)、TSIG、NSEC を用いた DNSSEC 
   - `dnssec-verify` と `delv` で検証済み（統合テスト参照）。
 - **TSIG**
   - HMAC-SHA1/256/384/512。リクエスト検証、応答署名、AXFR/IXFR の複数メッセージ署名。
+  - BADTIME の署名付き応答と簡易リプレイキャッシュ。
+- **運用**
+  - TCP アイドルタイムアウト、同時接続数制限、送信元ごとのレート制限。
 - **運用向け**
   - BIND 風の設定ファイル、ACL、SIGHUP によるゾーンリロード、チェック用 CLI。
 
@@ -121,7 +132,10 @@ zone "example.com" {
 - `directory` は `file` / `journal` / `dnssec-key` の相対パスの基準です。
 - `allow-transfer` は先勝ちです。`any`, `none`, IPv4/IPv6 アドレス、CIDR、`key "name"` を指定できます。
 - デフォルトの `allow-transfer` は **none** です。
-- `type` は `primary`（`master` も可）のみ。セカンダリは未実装です。
+- `type` は `primary` / `secondary`。セカンダリは `primary <addr>[:port];` と
+  `allow-notify { ... };` を指定します。プライマリは `also-notify <addr>[:port];` で
+  NOTIFY を送れます。
+- `allow-update { ... };` で RFC 2136 の動的更新を許可します。
 
 ## ゾーンファイル
 
@@ -155,8 +169,8 @@ ns.sub  IN A    192.0.2.100
 | `@` / 相対名 / 末尾 `.` | 原点 / 原点付加 / 絶対名 |
 | 行頭空白 | 前レコードのオーナーを継承 |
 
-未知の TYPE は `TYPE1234` と `\#` で表現できます。SVCB/HTTPS などの未対応 TYPE も
-`\#` 形式ならそのまま保存・転送されます。
+未知の TYPE は `TYPE1234` と `\#` で表現できます。未知の TYPE も `\#` 形式なら
+そのまま保存・転送されます。SVCB/HTTPS は主要パラメータのテキスト形式にも対応しています。
 
 ## CLI
 
@@ -225,6 +239,13 @@ DS の生成（親ゾーンに登録する値）:
 # example.com. 3600 IN DS 47259 13 2 ...
 ```
 
+NSEC3 で署名する場合:
+
+```sh
+./zig-out/bin/auth-dns serve -c examples/auth-dns.conf \
+  --dnssec-nsec3 --dnssec-nsec3-salt aabbccdd --dnssec-nsec3-iterations 0
+```
+
 サーバ起動:
 
 ```sh
@@ -243,14 +264,16 @@ dig @127.0.0.1 -p 15353 +dnssec missing.example.com A
 DNSKEY として公開し、DNSKEY RRset を KSK、それ以外を ZSK で署名します。
 これにより `dnssec-verify` が期待する KSK/ZSK 構成になります。
 
-NSEC3 は署名生成には未対応です（NSEC3/NSEC3PARAM の読み込み・転送は可能）。
-NSEC3 が必要な場合は今後の課題を参照してください。
+NSEC3 は `--dnssec-nsec3` / 設定の `dnssec-nsec3` で生成できます。
+`dnssec-nsec3-iterations` と `dnssec-nsec3-salt`（16 進）でパラメータを指定します。
+NSEC3 opt-out は未対応です。
 
 ## テスト
 
 ```sh
 zig build test
 ./scripts/integration-test.sh
+./scripts/advanced-test.sh
 ```
 
 `integration-test.sh` は `dig` / `delv` / `dnssec-verify` を使い、以下を検証します。
@@ -260,6 +283,9 @@ zig build test
 - DNSSEC の `RRSIG`、`delv` による A/NXDOMAIN/NODATA/ワイルドカードの完全検証
 - `dnssec-verify` によるゾーン全体の署名検証
 - SIGHUP リロード後の IXFR 差分
+
+`advanced-test.sh` は NSEC3、Dynamic Update（nsupdate）、セカンダリ/NOTIFY/IXFR、
+SVCB/HTTPS、TCP アイドル/レート制限、TSIG BADTIME を検証します。
 
 NSD をセカンダリにした相互運用テスト（Docker が必要）:
 
@@ -309,8 +335,8 @@ zone file
 | 1876 | LOC | 実装 |
 | 1982 | SOA シリアル演算 | 実装 |
 | 1995 | IXFR | 実装（サーバ側） |
-| 1996 | NOTIFY | 未実装（opcode 4 は NOTIMP） |
-| 2136 | Dynamic Update | 未実装 |
+| 1996 | NOTIFY | 実装（セカンダリの refresh 起動、プライマリの also-notify） |
+| 2136 | Dynamic Update | 実装（prerequisite/add/delete、TSIG） |
 | 2181 | 仕様の明確化 | TTL/RRset/CNAME/クラスを実装 |
 | 2308 | 否定キャッシュ | SOA 同梱・負の TTL を実装 |
 | 3597 | 未知 TYPE | `\#` / `TYPE####` を実装 |
@@ -321,6 +347,7 @@ zone file
 | 6891 | EDNS(0) | OPT/DO/BADVERS/サイズ処理 |
 | 7766 | DNS over TCP | 2 バイト長、接続再利用、パイプライン |
 | 8482 | ANY の最小化 | 全て返す（サブセット化は未実装） |
+| 9460 | SVCB/HTTPS | 主要パラメータのテキスト形式 |
 | 8945 | TSIG | HMAC、AXFR 連鎖、成功/一部エラー |
 
 より詳細な RFC ノートは [docs/rfc-notes/](docs/rfc-notes/) にあります。
@@ -332,14 +359,16 @@ DNSSEC 鍵更新の自動化設計（RRSIG 更新・ZSK/KSK ロールオーバ�
 
 - **DoT/DoH**: 現状は UDP/TCP のみ。TLS が必要なら libssl を追加し、`libcrypto` は
   そのまま使えます。`libssl` は TLS 終端のためだけに必要です。
-- **NSEC3**: 署名生成と NSEC3 否定証明は未実装。NSEC で運用するか、NSEC3 を追加してください。
-- **セカンダリ / NOTIFY / IXFR クライアント**: 現状はプライマリ専用です。
-  セカンダリを実装するなら、NOTIFY（RFC 1996）と IXFR クライアント（RFC 1995）を追加します。
-- **Dynamic Update（RFC 2136）**: 動的更新とジャーナル連携は未実装です。
-- **SVCB/HTTPS**: テキスト形式は未対応。`\#` 形式で保存・転送は可能です。
-- **TCP のアイドルタイムアウト / 接続数制限 / レート制限**: 運用向けに追加を推奨します。
-- **TSIG の BADTIME 署名応答 / リプレイキャッシュ**: 成功パスと BADKEY/BADSIG の
-  NOTAUTH は実装していますが、BADTIME の署名付き応答と時刻キャッシュは未実装です。
+- **NSEC3 opt-out**: NSEC3 は生成しますが、opt-out フラグ付きの委任省略には未対応です。
+- **セカンダリの TSIG**: 受信側の TSIG 検証と応答署名は実装済みですが、セカンダリから
+  プライマリへの AXFR/IXFR リクエストは現状 NOKEY です。TSIG を付ける場合は
+  `secondary.zig` にリクエスト署名を追加してください。
+- **DNSSEC 鍵更新の自動化**: 署名更新・ZSK/KSK ロールオーバーの設計は
+  [docs/dnssec-automation.md](docs/dnssec-automation.md) にあります。サーバ内の
+  自動スケジューラと CDS/CDNSKEY は未実装です。
+- **SVCB/HTTPS の追加パラメータ**: 主要パラメータは対応していますが、将来の
+  未知キーは `keyNNNNN` として保存・転送されます。
+- **ビュー / RPZ / カタログゾーン**: 未実装です。
 - **特権降下 / chroot / capabilities**: 53 番ポートで動かす場合は
   `CAP_NET_BIND_SERVICE` と専用ユーザーを推奨します。
 - **メトリクス / 構造化ログ**: 現在は stderr への簡易ログのみです。

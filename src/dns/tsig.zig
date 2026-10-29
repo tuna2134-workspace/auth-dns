@@ -107,15 +107,24 @@ pub fn findKey(keys: []const Key, key_name: *const name.Name, algorithm: *const 
     return null;
 }
 
+pub const VerifyContext = struct {
+    parsed: ?Parsed = null,
+    key: ?*const Key = null,
+    mac_valid: bool = false,
+};
+
 /// Verifies a request TSIG.  The TSIG must be the final record of the message.
 pub fn verifyRequest(
     allocator: std.mem.Allocator,
     raw: []const u8,
     rr: message.Record,
     keys: []const Key,
+    ctx: ?*VerifyContext,
 ) Error!Request {
     const parsed = try parse(rr);
+    if (ctx) |c| c.parsed = parsed;
     const key = findKey(keys, &parsed.key_name, &parsed.algorithm_name) orelse return error.BadKey;
+    if (ctx) |c| c.key = key;
     if (parsed.err_code != 0) return error.BadRdata;
     const hdr = message.Header.parse(raw) catch return error.BadRdata;
     if (parsed.original_id != hdr.id) return error.BadOriginalId;
@@ -142,6 +151,7 @@ pub fn verifyRequest(
     var diff: u8 = 0;
     for (parsed.mac, 0..) |b, i| diff |= b ^ mac[i];
     if (diff != 0) return error.BadMac;
+    if (ctx) |c| c.mac_valid = true;
     if (!withinFudge(now, parsed.time_signed, parsed.fudge)) return error.BadTime;
     const req_mac = try allocator.dupe(u8, parsed.mac);
     return .{
@@ -171,17 +181,29 @@ pub const Signed = struct {
     mac_len: u8 = 0,
 };
 
+pub const ResponseOptions = struct {
+    prior_mac: []const u8 = &.{},
+    original_id: u16,
+    timers_only: bool = false,
+    /// Overrides the response time (used for BADTIME, where the client's time
+    /// is echoed).
+    time_signed: ?u64 = null,
+    fudge: u16 = 300,
+    error_code: u16 = 0,
+    other: []const u8 = &.{},
+    /// Emit a TSIG with MAC size 0 (unsigned BADSIG/BADKEY errors).
+    omit_mac: bool = false,
+};
+
 pub fn appendResponse(
     allocator: std.mem.Allocator,
     buf: []u8,
     len: usize,
     key: *const Key,
-    prior_mac: []const u8,
-    original_id: u16,
-    timers_only: bool,
+    opts: ResponseOptions,
 ) Error!Signed {
-    const now = currentTime();
-    const fudge: u16 = 300;
+    const now = opts.time_signed orelse currentTime();
+    const fudge = opts.fudge;
 
     var rdata: std.ArrayList(u8) = .empty;
     defer rdata.deinit(allocator);
@@ -191,26 +213,30 @@ pub fn appendResponse(
     const mac_len_pos = rdata.items.len;
     try appendU16(&rdata, allocator, 0); // patched below
 
-    var input: std.ArrayList(u8) = .empty;
-    defer input.deinit(allocator);
-    if (prior_mac.len > 0) {
-        try appendU16(&input, allocator, @intCast(prior_mac.len));
-        try input.appendSlice(allocator, prior_mac);
-    }
-    try input.appendSlice(allocator, buf[0..len]);
-    if (timers_only) {
-        try appendU48(&input, allocator, now);
-        try appendU16(&input, allocator, fudge);
-    } else {
-        try appendVariables(&input, allocator, key, now, fudge, 0, &.{});
-    }
     var mac: [64]u8 = undefined;
-    const mac_len = try openssl.hmac(key.algorithm_text, key.secret, input.items, &mac);
+    var mac_len: usize = 0;
+    if (!opts.omit_mac) {
+        var input: std.ArrayList(u8) = .empty;
+        defer input.deinit(allocator);
+        if (opts.prior_mac.len > 0) {
+            try appendU16(&input, allocator, @intCast(opts.prior_mac.len));
+            try input.appendSlice(allocator, opts.prior_mac);
+        }
+        try input.appendSlice(allocator, buf[0..len]);
+        if (opts.timers_only) {
+            try appendU48(&input, allocator, now);
+            try appendU16(&input, allocator, fudge);
+        } else {
+            try appendVariables(&input, allocator, key, now, fudge, opts.error_code, opts.other);
+        }
+        mac_len = try openssl.hmac(key.algorithm_text, key.secret, input.items, &mac);
+    }
     writeU16(rdata.items, mac_len_pos, @intCast(mac_len));
     try rdata.appendSlice(allocator, mac[0..mac_len]);
-    try appendU16(&rdata, allocator, original_id);
-    try appendU16(&rdata, allocator, 0); // error
-    try appendU16(&rdata, allocator, 0); // other len
+    try appendU16(&rdata, allocator, opts.original_id);
+    try appendU16(&rdata, allocator, opts.error_code);
+    try appendU16(&rdata, allocator, @intCast(opts.other.len));
+    try rdata.appendSlice(allocator, opts.other);
 
     const rr_len = key.name_wire.len + 10 + rdata.items.len;
     if (len + rr_len > buf.len or len + rr_len > 65535) return error.NoSpace;
@@ -313,6 +339,44 @@ fn appendU48(out: *std.ArrayList(u8), allocator: std.mem.Allocator, v: u64) !voi
 
 fn wireEqlIgnoreCase(a: []const u8, b: []const u8) bool {
     return name.eqlWireIgnoreCase(a, b);
+}
+
+pub const ReplayCache = struct {
+    lock: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    times: std.StringHashMapUnmanaged(u64) = .{},
+
+    pub fn deinit(c: *ReplayCache, allocator: std.mem.Allocator) void {
+        c.times.deinit(allocator);
+    }
+
+    fn acquire(c: *ReplayCache) void {
+        while (c.lock.swap(true, .acquire)) std.atomic.spinLoopHint();
+    }
+
+    fn release(c: *ReplayCache) void {
+        c.lock.store(false, .release);
+    }
+
+    /// Rejects timestamps older than the newest seen time minus fudge.
+    /// Returns false when the request is a replay.
+    pub fn checkAndUpdate(c: *ReplayCache, allocator: std.mem.Allocator, key_name: []const u8, time_signed: u64, fudge: u16) bool {
+        c.acquire();
+        defer c.release();
+        const last = c.times.get(key_name) orelse 0;
+        if (last != 0 and time_signed +% fudge < last) return false;
+        if (time_signed > last) {
+            c.times.put(allocator, key_name, time_signed) catch return true;
+        }
+        return true;
+    }
+};
+
+/// 48-bit server time used in the Other Data field of BADTIME.
+pub fn serverTime48() [6]u8 {
+    const now = currentTime();
+    var out: [6]u8 = undefined;
+    for (0..6) |i| out[i] = @intCast((now >> @intCast(40 - 8 * i)) & 0xff);
+    return out;
 }
 
 test "build TSIG key" {

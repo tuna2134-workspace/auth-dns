@@ -15,6 +15,7 @@ const ast = @import("ast.zig");
 const zone = @import("zone.zig");
 const openssl = @import("../dnssec/openssl.zig");
 const dnssec_sign = @import("../dnssec/sign.zig");
+const nsec3 = @import("../dns/nsec3.zig");
 
 pub const Options = struct {
     origin: name.Name,
@@ -29,6 +30,10 @@ pub const DnssecOptions = struct {
     key_path: []const u8,
     key_flags: u16 = 257,
     validity: u32 = 30 * 24 * 3600,
+    nsec3: bool = false,
+    nsec3_iterations: u16 = 0,
+    /// Hex text; empty means the zero-length salt.
+    nsec3_salt: []const u8 = "",
 };
 
 pub const Error = error{
@@ -93,9 +98,20 @@ fn finalize(
     const pem = try std.Io.Dir.cwd().readFileAlloc(io, dc.key_path, tmp, .limited(1 << 20));
     var key = try openssl.Key.loadPem(tmp, pem);
     defer key.deinit(tmp);
+    var salt: []const u8 = &.{};
+    if (dc.nsec3_salt.len > 0) {
+        var sb: std.ArrayList(u8) = .empty;
+        errdefer sb.deinit(tmp);
+        try text.appendHex(&sb, tmp, dc.nsec3_salt);
+        salt = sb.items;
+    }
     const signed = try dnssec_sign.signZone(tmp, &unsigned, &key, .{
         .key_flags = dc.key_flags,
         .validity = dc.validity,
+        .nsec3 = if (dc.nsec3) nsec3.Params{
+            .iterations = dc.nsec3_iterations,
+            .salt = salt,
+        } else null,
     });
     return zone.Zone.build(backing, l.apex, l.class, signed, l.warnings.items);
 }

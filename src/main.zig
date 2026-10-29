@@ -60,10 +60,18 @@ fn cmdServe(init: std.process.Init, argv: []const []const u8) !void {
 
     var config_path: ?[]const u8 = null;
     var allow_text: []const u8 = "none";
+    var allow_update_text: []const u8 = "none";
     var dnssec_key: ?[]const u8 = null;
     var dnssec_flags: u16 = 257;
+    var dnssec_nsec3: bool = false;
+    var dnssec_nsec3_iterations: u16 = 0;
+    var dnssec_nsec3_salt: []const u8 = "";
     var journal_dir: ?[]const u8 = null;
     var max_udp: u16 = 1232;
+    var tcp_idle: u32 = 30;
+    var max_tcp: u32 = 256;
+    var rate_qps: u32 = 0;
+    var rate_burst: u32 = 0;
 
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -91,10 +99,18 @@ fn cmdServe(init: std.process.Init, argv: []const []const u8) !void {
             try zones.append(gpa, .{ .origin = origin, .file = v[eq + 1 ..] });
         } else if (std.mem.eql(u8, a, "--allow-transfer")) {
             allow_text = try nextArg(argv, &i, a);
+        } else if (std.mem.eql(u8, a, "--allow-update")) {
+            allow_update_text = try nextArg(argv, &i, a);
         } else if (std.mem.eql(u8, a, "--dnssec-key")) {
             dnssec_key = try nextArg(argv, &i, a);
         } else if (std.mem.eql(u8, a, "--dnssec-flags")) {
             dnssec_flags = std.fmt.parseInt(u16, try nextArg(argv, &i, a), 10) catch 257;
+        } else if (std.mem.eql(u8, a, "--dnssec-nsec3")) {
+            dnssec_nsec3 = true;
+        } else if (std.mem.eql(u8, a, "--dnssec-nsec3-iterations")) {
+            dnssec_nsec3_iterations = std.fmt.parseInt(u16, try nextArg(argv, &i, a), 10) catch 0;
+        } else if (std.mem.eql(u8, a, "--dnssec-nsec3-salt")) {
+            dnssec_nsec3_salt = try nextArg(argv, &i, a);
         } else if (std.mem.eql(u8, a, "--journal-dir")) {
             journal_dir = try nextArg(argv, &i, a);
         } else if (std.mem.eql(u8, a, "--tsig")) {
@@ -121,6 +137,18 @@ fn cmdServe(init: std.process.Init, argv: []const []const u8) !void {
             gpa.free(secret);
         } else if (std.mem.eql(u8, a, "--max-udp-size")) {
             max_udp = std.fmt.parseInt(u16, try nextArg(argv, &i, a), 10) catch 1232;
+        } else if (std.mem.eql(u8, a, "--tcp-idle")) {
+            tcp_idle = std.fmt.parseInt(u32, try nextArg(argv, &i, a), 10) catch 30;
+        } else if (std.mem.eql(u8, a, "--max-tcp-connections")) {
+            max_tcp = std.fmt.parseInt(u32, try nextArg(argv, &i, a), 10) catch 256;
+        } else if (std.mem.eql(u8, a, "--rate-limit")) {
+            const v = try nextArg(argv, &i, a);
+            if (std.mem.indexOfScalar(u8, v, ':')) |colon| {
+                rate_qps = std.fmt.parseInt(u32, v[0..colon], 10) catch 0;
+                rate_burst = std.fmt.parseInt(u32, v[colon + 1 ..], 10) catch 0;
+            } else {
+                rate_qps = std.fmt.parseInt(u32, v, 10) catch 0;
+            }
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             printServeUsage(init);
             return;
@@ -139,6 +167,10 @@ fn cmdServe(init: std.process.Init, argv: []const []const u8) !void {
             .keys = cfg.keys,
             .max_udp_size = cfg.max_udp_size,
             .tcp_max_size = cfg.tcp_max_size,
+            .tcp_idle_seconds = cfg.tcp_idle_seconds,
+            .max_tcp_connections = cfg.max_tcp_connections,
+            .rate_limit_qps = cfg.rate_limit_qps,
+            .rate_limit_burst = cfg.rate_limit_burst,
         });
         defer srv.deinit();
         try srv.run();
@@ -154,10 +186,18 @@ fn cmdServe(init: std.process.Init, argv: []const []const u8) !void {
     }
 
     const transfer_acl = try acl.parseList(gpa, allow_text);
+    const update_acl = try acl.parseList(gpa, allow_update_text);
     for (zones.items) |*zs| {
         zs.allow_transfer = transfer_acl;
+        zs.allow_update = update_acl;
         if (dnssec_key) |k| {
-            zs.dnssec = .{ .key_path = k, .key_flags = dnssec_flags };
+            zs.dnssec = .{
+                .key_path = k,
+                .key_flags = dnssec_flags,
+                .nsec3 = dnssec_nsec3,
+                .nsec3_iterations = dnssec_nsec3_iterations,
+                .nsec3_salt = dnssec_nsec3_salt,
+            };
         }
         if (journal_dir) |dir| {
             var tbuf: [name.max_name_len]u8 = undefined;
@@ -171,6 +211,10 @@ fn cmdServe(init: std.process.Init, argv: []const []const u8) !void {
         .zones = zones.items,
         .keys = keys.items,
         .max_udp_size = max_udp,
+        .tcp_idle_seconds = tcp_idle,
+        .max_tcp_connections = max_tcp,
+        .rate_limit_qps = rate_qps,
+        .rate_limit_burst = rate_burst,
     });
     defer server.deinit();
     try server.run();
@@ -240,6 +284,9 @@ fn cmdCheckZone(init: std.process.Init, argv: []const []const u8) !void {
     var origin: ?name.Name = null;
     var file: ?[]const u8 = null;
     var dnssec_key: ?[]const u8 = null;
+    var nsec3_enabled = false;
+    var nsec3_iterations: u16 = 0;
+    var nsec3_salt: []const u8 = "";
 
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
@@ -255,6 +302,12 @@ fn cmdCheckZone(init: std.process.Init, argv: []const []const u8) !void {
             file = try nextArg(argv, &i, a);
         } else if (std.mem.eql(u8, a, "--dnssec-key")) {
             dnssec_key = try nextArg(argv, &i, a);
+        } else if (std.mem.eql(u8, a, "--dnssec-nsec3")) {
+            nsec3_enabled = true;
+        } else if (std.mem.eql(u8, a, "--dnssec-nsec3-iterations")) {
+            nsec3_iterations = std.fmt.parseInt(u16, try nextArg(argv, &i, a), 10) catch 0;
+        } else if (std.mem.eql(u8, a, "--dnssec-nsec3-salt")) {
+            nsec3_salt = try nextArg(argv, &i, a);
         } else {
             std.debug.print("unknown option: {s}\n", .{a});
             std.process.exit(2);
@@ -267,7 +320,12 @@ fn cmdCheckZone(init: std.process.Init, argv: []const []const u8) !void {
 
     var z = sema.load(gpa, init.io, file.?, .{
         .origin = origin.?,
-        .dnssec = if (dnssec_key) |k| .{ .key_path = k } else null,
+        .dnssec = if (dnssec_key) |k| .{
+            .key_path = k,
+            .nsec3 = nsec3_enabled,
+            .nsec3_iterations = nsec3_iterations,
+            .nsec3_salt = nsec3_salt,
+        } else null,
     }) catch |e| {
         std.debug.print("zone {s}: load failed: {t}\n", .{ file.?, e });
         std.process.exit(1);
@@ -306,6 +364,7 @@ fn printUsage(init: std.process.Init) void {
         \\  auth-dns serve --config named.conf
         \\  auth-dns serve [options]
         \\  auth-dns checkzone --origin NAME --file FILE [--dnssec-key PEM]
+        \\      [--dnssec-nsec3] [--dnssec-nsec3-iterations N] [--dnssec-nsec3-salt HEX]
         \\  auth-dns ds --key PEM --name NAME [--flags 257]
         \\  auth-dns version
         \\
@@ -313,11 +372,18 @@ fn printUsage(init: std.process.Init) void {
         \\  -l, --listen ADDR:PORT       listen address (repeatable; default 127.0.0.1:15353)
         \\  -z, --zone NAME=FILE         zone apex and master file (repeatable)
         \\      --allow-transfer ACL     ACL list, e.g. "127.0.0.1,192.0.2.0/24,key:xfr"
+        \\      --allow-update ACL       ACL list for RFC 2136 dynamic updates
         \\      --dnssec-key PEM         sign every zone with this private key
         \\      --dnssec-flags N         DNSKEY flags (default 257)
+        \\      --dnssec-nsec3           generate an NSEC3 chain (instead of NSEC)
+        \\      --dnssec-nsec3-iterations N
+        \\      --dnssec-nsec3-salt HEX  NSEC3 salt (hex)
         \\      --journal-dir DIR        enable IXFR journals under DIR
         \\      --tsig NAME:ALG:SECRET   add a TSIG key (secret is base64)
         \\      --max-udp-size N         EDNS UDP payload limit (default 1232)
+        \\      --tcp-idle SECONDS       TCP idle timeout (default 30, 0 = off)
+        \\      --max-tcp-connections N  concurrent TCP connection limit
+        \\      --rate-limit QPS[:BURST] per-source query rate limit
         \\
     ) catch {};
     w.flush() catch {};

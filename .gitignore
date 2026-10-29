@@ -8,3 +8,4 @@ server.pid
 .nsd-test.*/
 integration/nsd/db/
 integration/nsd/zones/
+.advanced-test.*/

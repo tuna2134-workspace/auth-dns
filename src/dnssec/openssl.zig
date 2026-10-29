@@ -75,6 +75,11 @@ pub fn digestSha256(data: []const u8, out: *[32]u8) Error!void {
     if (EVP_Digest(data.ptr, data.len, out, &len, EVP_sha256(), null) != 1 or len != 32) return error.OpenSsl;
 }
 
+pub fn digestSha1(data: []const u8, out: *[20]u8) Error!void {
+    var len: c_uint = 0;
+    if (EVP_Digest(data.ptr, data.len, out, &len, EVP_sha1(), null) != 1 or len != 20) return error.OpenSsl;
+}
+
 pub fn digestSha384(data: []const u8, out: *[48]u8) Error!void {
     var len: c_uint = 0;
     if (EVP_Digest(data.ptr, data.len, out, &len, EVP_sha384(), null) != 1 or len != 48) return error.OpenSsl;

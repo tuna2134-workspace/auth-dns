@@ -7,6 +7,7 @@
 const std = @import("std");
 const name = @import("../dns/name.zig");
 const types = @import("../dns/types.zig");
+const nsec3 = @import("../dns/nsec3.zig");
 
 pub const Record = struct {
     owner: []const u8,
@@ -54,11 +55,15 @@ pub const Zone = struct {
     soa: RRset,
     serial: u32,
     minimum: u32,
+    refresh: u32,
+    retry: u32,
     negative_ttl: u32,
     signed: bool,
     warnings: []const []const u8,
     record_count: usize,
     nsec_names: []const []const u8,
+    nsec3_names: []const []const u8,
+    nsec3_params: ?nsec3.Params,
 
     pub fn deinit(z: *Zone) void {
         z.arena.deinit();
@@ -150,6 +155,8 @@ pub const Zone = struct {
         if (!has_ns_apex) return error.MissingNs;
         const serial = soaSerial(soa.rdata[0]) orelse return error.InvalidSoa;
         const minimum = soaMinimum(soa.rdata[0]) orelse return error.InvalidSoa;
+        const refresh = soaRefresh(soa.rdata[0]) orelse 3600;
+        const retry = soaRetry(soa.rdata[0]) orelse 600;
         const negative_ttl = @min(soa.ttl, minimum);
 
         var names: std.StringHashMapUnmanaged(void) = .{};
@@ -184,13 +191,24 @@ pub const Zone = struct {
         var record_count: usize = 0;
         var signed = false;
         var nsec_list: std.ArrayList([]const u8) = .empty;
+        var nsec3_list: std.ArrayList([]const u8) = .empty;
+        var nsec3_params: ?nsec3.Params = null;
         for (rrsets) |*rs| {
             record_count += rs.rdata.len;
             if (rs.rtype == types.DNSKEY and std.mem.eql(u8, rs.owner, origin_wire)) signed = true;
             if (rs.rtype == types.NSEC) try nsec_list.append(a, rs.owner);
+            if (rs.rtype == types.NSEC3) {
+                try nsec3_list.append(a, rs.owner);
+                if (nsec3_params == null and rs.rdata.len > 0) nsec3_params = nsec3.paramsFromRdata(rs.rdata[0]);
+            }
+            if (rs.rtype == types.NSEC3PARAM and std.mem.eql(u8, rs.owner, origin_wire) and rs.rdata.len > 0) {
+                nsec3_params = nsec3.paramsFromRdata(rs.rdata[0]);
+            }
         }
         const nsec_names = try nsec_list.toOwnedSlice(a);
         std.mem.sort([]const u8, nsec_names, {}, nsecLess);
+        const nsec3_names = try nsec3_list.toOwnedSlice(a);
+        std.mem.sort([]const u8, nsec3_names, {}, nsecLess);
 
         return .{
             .arena = arena,
@@ -204,11 +222,15 @@ pub const Zone = struct {
             .soa = soa,
             .serial = serial,
             .minimum = minimum,
+            .refresh = refresh,
+            .retry = retry,
             .negative_ttl = negative_ttl,
             .signed = signed,
             .warnings = try warnings.toOwnedSlice(a),
             .record_count = record_count,
             .nsec_names = nsec_names,
+            .nsec3_names = nsec3_names,
+            .nsec3_params = nsec3_params,
         };
     }
 
@@ -289,6 +311,30 @@ pub const Zone = struct {
         return null;
     }
 
+    pub fn nsec3At(z: *const Zone, owner: []const u8) ?*const RRset {
+        return z.rrsetAt(owner, types.NSEC3);
+    }
+
+    pub fn nsec3Covering(z: *const Zone, owner: []const u8) ?*const RRset {
+        if (z.nsec3_names.len == 0) return null;
+        var lo: usize = 0;
+        var hi: usize = z.nsec3_names.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (name.Name.canonicalCompareWire(z.nsec3_names[mid], owner) != .gt) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        const idx = if (lo == 0) z.nsec3_names.len - 1 else lo - 1;
+        return z.rrsetAt(z.nsec3_names[idx], types.NSEC3);
+    }
+
+    pub fn nsec3Params(z: *const Zone) ?nsec3.Params {
+        return z.nsec3_params;
+    }
+
     pub fn allRRsets(z: *const Zone) []const RRset {
         return z.rrsets;
     }
@@ -362,6 +408,91 @@ pub fn soaMinimum(rdata: []const u8) ?u32 {
     off = name.parseWire(rdata, off, &n) catch return null;
     if (off + 20 > rdata.len) return null;
     return readU32(rdata, off + 16);
+}
+
+pub fn soaRefresh(rdata: []const u8) ?u32 {
+    var n: name.Name = undefined;
+    var off = name.parseWire(rdata, 0, &n) catch return null;
+    off = name.parseWire(rdata, off, &n) catch return null;
+    if (off + 8 > rdata.len) return null;
+    return readU32(rdata, off + 4);
+}
+
+pub fn soaRetry(rdata: []const u8) ?u32 {
+    var n: name.Name = undefined;
+    var off = name.parseWire(rdata, 0, &n) catch return null;
+    off = name.parseWire(rdata, off, &n) catch return null;
+    if (off + 12 > rdata.len) return null;
+    return readU32(rdata, off + 8);
+}
+
+/// Flattens all RRsets into individual records.  Owner/RDATA slices point
+/// into the zone arena.
+pub fn flatten(z: *const Zone, allocator: std.mem.Allocator) ![]Record {
+    var out: std.ArrayList(Record) = .empty;
+    errdefer out.deinit(allocator);
+    for (z.allRRsets()) |*rs| {
+        for (rs.rdata) |rd| {
+            try out.append(allocator, .{
+                .owner = rs.owner,
+                .rtype = rs.rtype,
+                .class = z.class,
+                .ttl = rs.ttl,
+                .rdata = rd,
+            });
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn soaWithSerial(allocator: std.mem.Allocator, soa_rdata: []const u8, serial: u32) ![]u8 {
+    var n: name.Name = undefined;
+    var off = try name.parseWire(soa_rdata, 0, &n);
+    off = try name.parseWire(soa_rdata, off, &n);
+    if (off + 20 > soa_rdata.len) return error.InvalidSoa;
+    const out = try allocator.dupe(u8, soa_rdata);
+    std.mem.writeInt(u32, out[off..][0..4], serial, .big);
+    return out;
+}
+
+pub fn appendSerial(serial: u32) u32 {
+    if (serial == 0x7fffffff) return 1;
+    return serial + 1;
+}
+
+pub fn writeRecords(records: []const Record, allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
+    for (records) |r| {
+        var owner_name = name.Name.init(r.owner) catch continue;
+        try owner_name.writeText(w);
+        var tbuf: [12]u8 = undefined;
+        try w.print("\t{d}\tIN\t{s}\t", .{ r.ttl, types.typeToTextBuf(r.rtype, &tbuf) });
+        try @import("../dns/rdata.zig").toText(allocator, r.rtype, r.rdata, w);
+        try w.writeByte('\n');
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = aw.written() });
+}
+
+/// Writes the zone in BIND master-file form.  Complex/unknown RDATA is
+/// emitted with the RFC 3597 \# representation, so the output reloads
+/// losslessly even for types without a presentation formatter.
+pub fn writeFile(z: *const Zone, allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
+    for (z.allRRsets()) |*rs| {
+        var owner_name = name.Name.init(rs.owner) catch continue;
+        for (rs.rdata) |rd| {
+            try owner_name.writeText(w);
+            var tbuf: [12]u8 = undefined;
+            try w.print("\t{d}\tIN\t{s}\t", .{ rs.ttl, types.typeToTextBuf(rs.rtype, &tbuf) });
+            try @import("../dns/rdata.zig").toText(allocator, rs.rtype, rd, w);
+            try w.writeByte('\n');
+        }
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = aw.written() });
 }
 
 pub fn rrsigTypeCovered(rdata: []const u8) u16 {

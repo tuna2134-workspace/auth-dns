@@ -30,6 +30,7 @@ const text = @import("../dns/text.zig");
 const tsig = @import("../dns/tsig.zig");
 const acl = @import("acl.zig");
 const server = @import("server.zig");
+const secondary = @import("secondary.zig");
 
 pub const Error = error{ConfigError};
 
@@ -121,6 +122,10 @@ pub const Config = struct {
     keys: []const tsig.Key,
     max_udp_size: u16 = 1232,
     tcp_max_size: usize = 65535,
+    tcp_idle_seconds: u32 = 30,
+    max_tcp_connections: u32 = 256,
+    rate_limit_qps: u32 = 0,
+    rate_limit_burst: u32 = 0,
 
     pub fn deinit(c: *Config) void {
         c.arena.deinit();
@@ -130,10 +135,18 @@ pub const Config = struct {
 const ZoneBuild = struct {
     origin: name.Name,
     file: []const u8 = "",
+    role: server.Role = .primary,
+    primaries: std.ArrayList(secondary.Primary) = .empty,
+    allow_notify: acl.Set = .{ .entries = &.{} },
+    allow_update: acl.Set = .{ .entries = &.{} },
+    also_notify: std.ArrayList(Io.net.IpAddress) = .empty,
     journal: ?[]const u8 = null,
     allow: acl.Set = .{ .entries = &.{} },
     dnssec_key: ?[]const u8 = null,
     dnssec_flags: u16 = 257,
+    dnssec_nsec3: bool = false,
+    dnssec_nsec3_iterations: u16 = 0,
+    dnssec_nsec3_salt: []const u8 = "",
 };
 
 const KeyBuild = struct {
@@ -153,6 +166,10 @@ const Parser = struct {
     directory: []const u8 = "",
     max_udp: u16 = 1232,
     tcp_max: usize = 65535,
+    tcp_idle: u32 = 30,
+    max_tcp: u32 = 256,
+    rate_qps: u32 = 0,
+    rate_burst: u32 = 0,
 
     fn peek(p: *Parser) Token {
         return p.tokens[@min(p.pos, p.tokens.len - 1)];
@@ -213,6 +230,19 @@ const Parser = struct {
             } else if (std.mem.eql(u8, t.text, "tcp-max-size")) {
                 const a = p.advance();
                 p.tcp_max = std.fmt.parseInt(usize, a.text, 10) catch return p.fail(a.line);
+            } else if (std.mem.eql(u8, t.text, "tcp-idle-timeout")) {
+                const a = p.advance();
+                p.tcp_idle = std.fmt.parseInt(u32, a.text, 10) catch return p.fail(a.line);
+            } else if (std.mem.eql(u8, t.text, "max-tcp-connections")) {
+                const a = p.advance();
+                p.max_tcp = std.fmt.parseInt(u32, a.text, 10) catch return p.fail(a.line);
+            } else if (std.mem.eql(u8, t.text, "rate-limit")) {
+                const a = p.advance();
+                p.rate_qps = std.fmt.parseInt(u32, a.text, 10) catch return p.fail(a.line);
+                if (p.peek().kind == .word) {
+                    const b = p.advance();
+                    p.rate_burst = std.fmt.parseInt(u32, b.text, 10) catch return p.fail(b.line);
+                }
             } else {
                 return p.fail(t.line);
             }
@@ -235,7 +265,30 @@ const Parser = struct {
             if (t.kind != .word) return p.fail(t.line);
             if (std.mem.eql(u8, t.text, "type")) {
                 const a = p.advance();
-                if (!std.ascii.eqlIgnoreCase(a.text, "primary") and !std.ascii.eqlIgnoreCase(a.text, "master")) return p.fail(a.line);
+                if (std.ascii.eqlIgnoreCase(a.text, "primary") or std.ascii.eqlIgnoreCase(a.text, "master")) {
+                    z.role = .primary;
+                } else if (std.ascii.eqlIgnoreCase(a.text, "secondary") or std.ascii.eqlIgnoreCase(a.text, "slave")) {
+                    z.role = .secondary;
+                } else {
+                    return p.fail(a.line);
+                }
+            } else if (std.mem.eql(u8, t.text, "primary")) {
+                const a = p.advance();
+                const addr = Io.net.IpAddress.parseLiteral(a.text) catch return p.fail(a.line);
+                var key_name: ?[]const u8 = null;
+                if (p.peek().kind == .word or p.peek().kind == .string) {
+                    const k = p.advance();
+                    key_name = k.text;
+                }
+                try z.primaries.append(p.allocator, .{ .addr = addr, .key_name = key_name });
+            } else if (std.mem.eql(u8, t.text, "allow-notify")) {
+                z.allow_notify = try p.parseAcl();
+            } else if (std.mem.eql(u8, t.text, "allow-update")) {
+                z.allow_update = try p.parseAcl();
+            } else if (std.mem.eql(u8, t.text, "also-notify")) {
+                const a = p.advance();
+                const addr = Io.net.IpAddress.parseLiteral(a.text) catch return p.fail(a.line);
+                try z.also_notify.append(p.allocator, addr);
             } else if (std.mem.eql(u8, t.text, "file")) {
                 const a = p.advance();
                 z.file = a.text;
@@ -248,6 +301,15 @@ const Parser = struct {
             } else if (std.mem.eql(u8, t.text, "dnssec-flags")) {
                 const a = p.advance();
                 z.dnssec_flags = std.fmt.parseInt(u16, a.text, 10) catch return p.fail(a.line);
+            } else if (std.mem.eql(u8, t.text, "dnssec-nsec3")) {
+                const a = p.advance();
+                z.dnssec_nsec3 = std.ascii.eqlIgnoreCase(a.text, "yes") or std.ascii.eqlIgnoreCase(a.text, "true") or std.mem.eql(u8, a.text, "1");
+            } else if (std.mem.eql(u8, t.text, "dnssec-nsec3-iterations")) {
+                const a = p.advance();
+                z.dnssec_nsec3_iterations = std.fmt.parseInt(u16, a.text, 10) catch return p.fail(a.line);
+            } else if (std.mem.eql(u8, t.text, "dnssec-nsec3-salt")) {
+                const a = p.advance();
+                z.dnssec_nsec3_salt = a.text;
             } else if (std.mem.eql(u8, t.text, "allow-transfer")) {
                 z.allow = try p.parseAcl();
             } else {
@@ -346,16 +408,27 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Config {
     const dir = if (p.directory.len > 0) p.directory else base_dir;
 
     var zones: std.ArrayList(server.ZoneSpec) = .empty;
-    for (p.zone_list.items) |z| {
+    for (p.zone_list.items) |*z| {
         const file = try resolve(a, dir, z.file);
         const journal = if (z.journal) |j| try resolve(a, dir, j) else null;
         const key_path = if (z.dnssec_key) |k| try resolve(a, dir, k) else null;
         try zones.append(a, .{
             .origin = z.origin,
             .file = file,
+            .role = z.role,
+            .primaries = try z.primaries.toOwnedSlice(a),
+            .allow_notify = z.allow_notify,
+            .allow_update = z.allow_update,
+            .also_notify = try z.also_notify.toOwnedSlice(a),
             .journal_path = journal,
             .allow_transfer = z.allow,
-            .dnssec = if (key_path) |kp| .{ .key_path = kp, .key_flags = z.dnssec_flags } else null,
+            .dnssec = if (key_path) |kp| .{
+                .key_path = kp,
+                .key_flags = z.dnssec_flags,
+                .nsec3 = z.dnssec_nsec3,
+                .nsec3_iterations = z.dnssec_nsec3_iterations,
+                .nsec3_salt = z.dnssec_nsec3_salt,
+            } else null,
         });
     }
 
@@ -383,6 +456,10 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Config {
         .keys = try keys.toOwnedSlice(a),
         .max_udp_size = p.max_udp,
         .tcp_max_size = p.tcp_max,
+        .tcp_idle_seconds = p.tcp_idle,
+        .max_tcp_connections = p.max_tcp,
+        .rate_limit_qps = p.rate_qps,
+        .rate_limit_burst = p.rate_burst,
     };
 }
 

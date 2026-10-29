@@ -17,7 +17,10 @@ const transfer = @import("../zone/transfer.zig");
 const ZoneSet = @import("queryset.zig").ZoneSet;
 const Responder = @import("query.zig").Responder;
 const acl = @import("acl.zig");
+const ratelimit = @import("ratelimit.zig");
 const tsig = @import("../dns/tsig.zig");
+const secondary = @import("secondary.zig");
+const update = @import("update.zig");
 
 pub const Listen = struct {
     addr: Io.net.IpAddress,
@@ -26,10 +29,17 @@ pub const Listen = struct {
 pub const ZoneSpec = struct {
     origin: name.Name,
     file: []const u8,
+    role: Role = .primary,
+    primaries: []const secondary.Primary = &.{},
+    allow_notify: acl.Set = .{ .entries = &.{} },
+    allow_update: acl.Set = .{ .entries = &.{} },
+    also_notify: []const Io.net.IpAddress = &.{},
     journal_path: ?[]const u8 = null,
     allow_transfer: acl.Set = .{ .entries = &.{} },
     dnssec: ?sema.DnssecOptions = null,
 };
+
+pub const Role = enum { primary, secondary };
 
 pub const Config = struct {
     listeners: []const Listen,
@@ -37,13 +47,26 @@ pub const Config = struct {
     keys: []const tsig.Key = &.{},
     max_udp_size: u16 = 1232,
     tcp_max_size: usize = 65535,
+    tcp_idle_seconds: u32 = 30,
+    max_tcp_connections: u32 = 256,
+    rate_limit_qps: u32 = 0,
+    rate_limit_burst: u32 = 0,
 };
 
 const ZoneEntry = struct {
     zone: zone.Zone,
     journal: journal_mod.Journal,
     journal_path: ?[]const u8,
+    zone_file: []const u8,
+    origin: name.Name,
+    role: Role,
+    primaries: []const secondary.Primary,
+    allow_notify: acl.Set,
+    allow_update: acl.Set,
+    also_notify: []const Io.net.IpAddress,
     allow_transfer: acl.Set,
+    dnssec: ?sema.DnssecOptions = null,
+    next_refresh_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
 pub const Server = struct {
@@ -55,6 +78,9 @@ pub const Server = struct {
     udp: []Io.net.Socket,
     tcp: []Io.net.Server,
     lock: Io.RwLock = .init,
+    rate: ratelimit.Limiter = .{},
+    replay: tsig.ReplayCache = .{},
+    active_tcp: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     pub fn init(gpa: std.mem.Allocator, io: Io, config: Config) !Server {
         const entries = try gpa.alloc(ZoneEntry, config.zones.len);
@@ -68,7 +94,28 @@ pub const Server = struct {
         }
 
         for (config.zones, 0..) |zs, i| {
-            var z = sema.load(gpa, io, zs.file, .{
+            var z = if (zs.role == .secondary) blk: {
+                const existing = sema.load(gpa, io, zs.file, .{
+                    .origin = zs.origin,
+                }) catch |e| switch (e) {
+                    error.FileNotFound => {
+                        if (zs.primaries.len == 0) {
+                            std.debug.print("secondary zone {s} has no primary\n", .{zs.file});
+                            return e;
+                        }
+                        const res = secondary.fetch(gpa, io, zs.origin, types.class_in, zs.primaries[0], null) catch |fe| {
+                            std.debug.print("initial transfer for {s} failed: {t}\n", .{ zs.file, fe });
+                            return fe;
+                        };
+                        switch (res) {
+                            .up_to_date => return error.BadTransfer,
+                            .zone => |zz| break :blk zz,
+                        }
+                    },
+                    else => return e,
+                };
+                break :blk existing;
+            } else sema.load(gpa, io, zs.file, .{
                 .origin = zs.origin,
                 .dnssec = zs.dnssec,
             }) catch |e| {
@@ -76,6 +123,14 @@ pub const Server = struct {
                 return e;
             };
             errdefer z.deinit();
+
+            if (zs.role == .secondary) {
+                // Persist the transferred zone so the next start can resume.
+                zone.writeFile(&z, gpa, io, zs.file) catch |e| {
+                    std.debug.print("cannot write secondary zone {s}: {t}\n", .{ zs.file, e });
+                };
+            }
+
             var j = if (zs.journal_path) |p|
                 journal_mod.Journal.load(gpa, io, p) catch |e| {
                     std.debug.print("cannot load journal {s}: {t}\n", .{ p, e });
@@ -91,14 +146,23 @@ pub const Server = struct {
                 .zone = z,
                 .journal = j,
                 .journal_path = zs.journal_path,
+                .zone_file = zs.file,
+                .origin = zs.origin,
+                .role = zs.role,
+                .primaries = zs.primaries,
+                .allow_notify = zs.allow_notify,
+                .allow_update = zs.allow_update,
+                .also_notify = zs.also_notify,
                 .allow_transfer = zs.allow_transfer,
+                .dnssec = zs.dnssec,
+                .next_refresh_ms = std.atomic.Value(u64).init(if (zs.role == .secondary) nowMs() + @as(u64, z.refresh) * 1000 else 0),
             };
             loaded += 1;
 
             var nbuf: [name.max_name_len]u8 = undefined;
             for (z.warnings) |w| std.debug.print("zone {s}: warning: {s}\n", .{ z.origin.toText(&nbuf) catch z.origin_wire, w });
-            std.debug.print("loaded zone {s} serial {d} ({d} records){s}\n", .{
-                z.origin.toText(&nbuf) catch z.origin_wire, z.serial, z.record_count, if (z.isSigned()) " [signed]" else "",
+            std.debug.print("loaded {s} zone {s} serial {d} ({d} records){s}\n", .{
+                @tagName(zs.role), z.origin.toText(&nbuf) catch z.origin_wire, z.serial, z.record_count, if (z.isSigned()) " [signed]" else "",
             });
         }
 
@@ -138,10 +202,13 @@ pub const Server = struct {
             .zone_ptrs = zone_ptrs,
             .udp = try udp.toOwnedSlice(gpa),
             .tcp = try tcp.toOwnedSlice(gpa),
+            .rate = ratelimit.Limiter.init(config.rate_limit_qps, config.rate_limit_burst),
         };
     }
 
     pub fn deinit(self: *Server) void {
+        self.rate.deinit(self.gpa);
+        self.replay.deinit(self.gpa);
         for (self.udp) |*s| s.close(self.io);
         for (self.tcp) |*s| s.deinit(self.io);
         self.gpa.free(self.udp);
@@ -183,6 +250,7 @@ pub const Server = struct {
             if (reload_requested.swap(false, .acquire)) {
                 self.reload() catch |e| std.debug.print("reload failed: {t}\n", .{e});
             }
+            self.refreshSecondaries();
             Io.sleep(self.io, .fromNanoseconds(1 * std.time.ns_per_s), .awake) catch {};
         }
     }
@@ -191,6 +259,10 @@ pub const Server = struct {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
         for (self.config.zones, 0..) |spec, i| {
+            if (spec.role == .secondary) {
+                self.entries[i].next_refresh_ms.store(0, .release);
+                continue;
+            }
             var newz = sema.load(self.gpa, self.io, spec.file, .{
                 .origin = spec.origin,
                 .dnssec = spec.dnssec,
@@ -199,6 +271,7 @@ pub const Server = struct {
                 continue;
             };
             const old = &self.entries[i].zone;
+            const serial_changed = newz.serial != old.serial;
             if (newz.serial == old.serial) {
                 // A periodic re-sign changes only RRSIGs; keep the IXFR
                 // history in that case.  Any real data change with the same
@@ -236,8 +309,194 @@ pub const Server = struct {
             }
             old.deinit();
             self.entries[i].zone = newz;
+            if (serial_changed) self.sendNotify(&self.entries[i]);
             var nbuf: [name.max_name_len]u8 = undefined;
             std.debug.print("reloaded zone {s} serial {d}\n", .{ newz.origin.toText(&nbuf) catch newz.origin_wire, newz.serial });
+        }
+    }
+
+    fn processUpdate(self: *Server, q: *const message.Message, from: Io.net.IpAddress, tsig_req: ?*const tsig.Request) types.Rcode {
+        if (q.header.qdcount != 1) return .formerr;
+        const qq = q.question() orelse return .formerr;
+        if (qq.qtype != types.SOA or qq.qclass != types.class_in) return .formerr;
+        var lower: [name.max_name_len]u8 = undefined;
+        const qn = zone.Zone.normalize(qq.qname.slice(), &lower);
+        var entry: ?*ZoneEntry = null;
+        for (self.entries) |*e| {
+            if (e.role != .primary) continue;
+            if (std.mem.eql(u8, qn, e.origin.slice())) {
+                entry = e;
+                break;
+            }
+        }
+        const e = entry orelse return .notauth;
+        const key_name: ?[]const u8 = if (tsig_req) |r| r.key.name_text else null;
+        if (!e.allow_update.allows(from, key_name)) {
+            std.debug.print("update refused by ACL from {f}\n", .{from});
+            return .refused;
+        }
+
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const outcome = update.apply(a, &e.zone, q, e.dnssec != null) catch |err| {
+            std.debug.print("update apply error: {t}\n", .{err});
+            return .servfail;
+        };
+        switch (outcome) {
+            .rcode => |rc| {
+                std.debug.print("update rcode {s}\n", .{types.rcodeToText(@backingInt(rc))});
+                return rc;
+            },
+            .ok => |recs| {
+                const tmp = std.fmt.allocPrint(a, "{s}.tmp", .{e.zone_file}) catch return .servfail;
+                zone.writeRecords(recs, a, self.io, tmp) catch return .servfail;
+                const newz = sema.load(self.gpa, self.io, tmp, .{
+                    .origin = e.origin,
+                    .dnssec = e.dnssec,
+                }) catch |err| {
+                    std.debug.print("update reload {s} failed: {t}\n", .{ tmp, err });
+                    return .refused;
+                };
+                var old = e.zone;
+                var delta = journal_mod.diff(self.gpa, &old, &newz) catch {
+                    var t = newz;
+                    t.deinit();
+                    return .servfail;
+                };
+                e.journal.append(delta) catch {
+                    delta.deinit(self.gpa);
+                    var t = newz;
+                    t.deinit();
+                    return .servfail;
+                };
+                if (e.journal_path) |p| e.journal.save(self.io, p) catch {};
+                std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), e.zone_file, self.io) catch {
+                    std.Io.Dir.cwd().deleteFile(self.io, tmp) catch {};
+                    var t = newz;
+                    t.deinit();
+                    return .servfail;
+                };
+                e.zone = newz;
+                old.deinit();
+                self.sendNotify(e);
+                return .noerror;
+            },
+        }
+    }
+
+    fn updateResponse(self: *Server, buf: []u8, q: *const message.Message, rcode: types.Rcode) []u8 {
+        _ = self;
+        var h: message.Header = .{ .id = q.header.id };
+        h.setQr(true);
+        h.setOpcode(5);
+        h.setRcode(@backingInt(rcode));
+        var b = message.Builder.init(buf, h, buf.len) catch return buf[0..0];
+        if (q.question()) |qq| b.addQuestion(qq.qname.slice(), qq.qtype, qq.qclass) catch {};
+        return b.finish();
+    }
+
+    fn sendUpdateUdp(self: *Server, sock: *Io.net.Socket, to: Io.net.IpAddress, q: *const message.Message, rcode: types.Rcode, tsig_req: ?*const tsig.Request) void {
+        var buf: [4096]u8 = undefined;
+        const wire = self.updateResponse(&buf, q, rcode);
+        if (tsig_req) |req| {
+            const signed = tsig.appendResponse(self.gpa, &buf, wire.len, req.key, .{
+                .prior_mac = req.mac,
+                .original_id = req.original_id,
+            }) catch return;
+            sock.send(self.io, &to, buf[0..signed.len]) catch {};
+            return;
+        }
+        sock.send(self.io, &to, wire) catch {};
+    }
+
+    fn sendUpdateTcp(self: *Server, stream: *const Io.net.Stream, q: *const message.Message, rcode: types.Rcode, tsig_req: ?*const tsig.Request) void {
+        var buf: [4096]u8 = undefined;
+        const wire = self.updateResponse(&buf, q, rcode);
+        if (tsig_req) |req| {
+            const signed = tsig.appendResponse(self.gpa, &buf, wire.len, req.key, .{
+                .prior_mac = req.mac,
+                .original_id = req.original_id,
+            }) catch return;
+            self.writeTcp(stream, buf[0..signed.len]) catch {};
+            return;
+        }
+        self.writeTcp(stream, wire) catch {};
+    }
+
+    fn refreshSecondaries(self: *Server) void {
+        const now = nowMs();
+        for (self.entries, 0..) |*e, i| {
+            if (e.role != .secondary) continue;
+            if (now < e.next_refresh_ms.load(.acquire)) continue;
+            self.refreshSecondary(e, self.config.zones[i]) catch |err| {
+                std.debug.print("secondary refresh {s}: {t}\n", .{ e.zone_file, err });
+                const retry = @max(@as(u64, e.zone.retry), 5);
+                e.next_refresh_ms.store(nowMs() + retry * 1000, .release);
+            };
+        }
+    }
+
+    fn refreshSecondary(self: *Server, e: *ZoneEntry, spec: ZoneSpec) !void {
+        if (spec.primaries.len == 0) return error.NoPrimary;
+        const res = secondary.fetch(self.gpa, self.io, e.origin, e.zone.class, spec.primaries[0], &e.zone) catch |err| {
+            return err;
+        };
+        switch (res) {
+            .up_to_date => {},
+            .zone => |newz| {
+                var delta = journal_mod.diff(self.gpa, &e.zone, &newz) catch |err| {
+                    var t = newz;
+                    t.deinit();
+                    return err;
+                };
+                self.lock.lockUncancelable(self.io);
+                defer self.lock.unlock(self.io);
+                e.journal.append(delta) catch |err| {
+                    delta.deinit(self.gpa);
+                    var t = newz;
+                    t.deinit();
+                    return err;
+                };
+                if (e.journal_path) |p| e.journal.save(self.io, p) catch |err| {
+                    std.debug.print("journal save {s}: {t}\n", .{ p, err });
+                };
+                var old = e.zone;
+                e.zone = newz;
+                old.deinit();
+                zone.writeFile(&e.zone, self.gpa, self.io, e.zone_file) catch |err| {
+                    std.debug.print("secondary zone write {s}: {t}\n", .{ e.zone_file, err });
+                };
+                var nbuf: [name.max_name_len]u8 = undefined;
+                std.debug.print("secondary zone {s} updated to serial {d}\n", .{
+                    e.zone.origin.toText(&nbuf) catch e.zone.origin_wire, e.zone.serial,
+                });
+                self.sendNotify(e);
+            },
+        }
+        const interval = @max(@as(u64, e.zone.refresh), 5);
+        e.next_refresh_ms.store(nowMs() + interval * 1000, .release);
+    }
+
+    fn sendNotify(self: *Server, e: *ZoneEntry) void {
+        if (e.also_notify.len == 0 or self.udp.len == 0) return;
+        var buf: [512]u8 = undefined;
+        var random_id: u16 = 0;
+        self.io.random(std.mem.asBytes(&random_id));
+        var h: message.Header = .{ .id = random_id };
+        h.setOpcode(4);
+        h.setAa(true);
+        var b = message.Builder.init(&buf, h, buf.len) catch return;
+        b.addQuestion(e.origin.slice(), types.SOA, types.class_in) catch return;
+        const wire = b.finish();
+        for (e.also_notify) |addr| {
+            std.debug.print("sending NOTIFY {s} to {f}\n", .{ @tagName(e.role), addr });
+            self.udp[0].send(self.io, &addr, wire) catch |err| {
+                std.debug.print("NOTIFY send failed: {t}\n", .{err});
+            };
         }
     }
 
@@ -260,6 +519,7 @@ pub const Server = struct {
     }
 
     fn handleUdp(self: *Server, responder: *const Responder, sock: *Io.net.Socket, msg: Io.net.IncomingMessage) void {
+        if (self.rate.enabled() and !self.rate.allow(self.gpa, msg.from)) return;
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         const a = arena.allocator();
@@ -268,9 +528,18 @@ pub const Server = struct {
             self.sendUdpRcode(sock, msg.from, msg.data, 1);
             return;
         };
+        if (q.header.opcode() == 4) {
+            if (!q.header.qr()) self.handleNotifyUdp(&q, msg.from, sock);
+            return;
+        }
         var tsig_req: ?tsig.Request = null;
         if (q.tsig()) |rr| {
-            tsig_req = tsig.verifyRequest(a, q.raw, rr, self.config.keys) catch |e| {
+            var ctx: tsig.VerifyContext = .{};
+            tsig_req = tsig.verifyRequest(a, q.raw, rr, self.config.keys, &ctx) catch |e| {
+                if (e == error.BadTime and ctx.key != null and ctx.mac_valid) {
+                    self.sendUdpBadTime(sock, msg.from, msg.data, &ctx);
+                    return;
+                }
                 const rcode: u4 = switch (e) {
                     error.BadKey, error.BadMac, error.BadTime, error.MacTooShort, error.MacTooLong => 9,
                     else => 1,
@@ -278,6 +547,15 @@ pub const Server = struct {
                 self.sendUdpRcode(sock, msg.from, msg.data, rcode);
                 return;
             };
+            if (!self.replay.checkAndUpdate(self.gpa, ctx.key.?.name_wire, ctx.parsed.?.time_signed, ctx.parsed.?.fudge)) {
+                self.sendUdpBadTime(sock, msg.from, msg.data, &ctx);
+                return;
+            }
+        }
+        if (q.header.opcode() == 5) {
+            const rcode = self.processUpdate(&q, msg.from, if (tsig_req) |*r| r else null);
+            self.sendUpdateUdp(sock, msg.from, &q, rcode, if (tsig_req) |*r| r else null);
+            return;
         }
         const reserve: usize = if (tsig_req != null) 512 else 0;
 
@@ -293,7 +571,10 @@ pub const Server = struct {
             .message => |wire| {
                 var out = wire;
                 if (tsig_req) |req| {
-                    const signed = tsig.appendResponse(a, &rbuf, wire.len, req.key, req.mac, req.original_id, false) catch {
+                    const signed = tsig.appendResponse(a, &rbuf, wire.len, req.key, .{
+                        .prior_mac = req.mac,
+                        .original_id = req.original_id,
+                    }) catch {
                         self.sendUdpRcode(sock, msg.from, msg.data, 2);
                         return;
                     };
@@ -303,6 +584,51 @@ pub const Server = struct {
             },
             .transfer => self.sendUdpRcode(sock, msg.from, msg.data, 5),
         }
+    }
+
+    fn notifyResponse(self: *Server, buf: []u8, q: *const message.Message, rcode: types.Rcode) []u8 {
+        _ = self;
+        var h: message.Header = .{ .id = q.header.id };
+        h.setQr(true);
+        h.setOpcode(4);
+        h.setRcode(@backingInt(rcode));
+        var b = message.Builder.init(buf, h, buf.len) catch return buf[0..0];
+        if (q.question()) |qq| b.addQuestion(qq.qname.slice(), qq.qtype, qq.qclass) catch {};
+        return b.finish();
+    }
+
+    fn handleNotifyUdp(self: *Server, q: *const message.Message, from: Io.net.IpAddress, sock: *Io.net.Socket) void {
+        const rcode = self.acceptNotify(q, from);
+        var buf: [512]u8 = undefined;
+        const wire = self.notifyResponse(&buf, q, rcode);
+        sock.send(self.io, &from, wire) catch {};
+    }
+
+    fn handleNotifyTcp(self: *Server, q: *const message.Message, from: Io.net.IpAddress, stream: *const Io.net.Stream) void {
+        const rcode = self.acceptNotify(q, from);
+        var buf: [512]u8 = undefined;
+        const wire = self.notifyResponse(&buf, q, rcode);
+        self.writeTcp(stream, wire) catch {};
+    }
+
+    fn acceptNotify(self: *Server, q: *const message.Message, from: Io.net.IpAddress) types.Rcode {
+        if (q.header.qr() or q.header.qdcount != 1) return .formerr;
+        const qq = q.question() orelse return .formerr;
+        if (qq.qtype != types.SOA or qq.qclass != types.class_in) return .formerr;
+        var lower: [name.max_name_len]u8 = undefined;
+        const qn = zone.Zone.normalize(qq.qname.slice(), &lower);
+        for (self.entries) |*e| {
+            if (e.role != .secondary) continue;
+            if (!std.mem.eql(u8, qn, e.origin.slice())) continue;
+            if (!e.allow_notify.allows(from, null)) {
+                std.debug.print("NOTIFY refused from {f}\n", .{from});
+                return .refused;
+            }
+            std.debug.print("NOTIFY accepted for {s} from {f}\n", .{ e.zone_file, from });
+            e.next_refresh_ms.store(0, .release);
+            return .noerror;
+        }
+        return .notauth;
     }
 
     fn sendUdpRcode(self: *Server, sock: *Io.net.Socket, to: Io.net.IpAddress, query: []const u8, rcode: u4) void {
@@ -343,7 +669,14 @@ pub const Server = struct {
                 std.debug.print("tcp accept: {t}\n", .{e});
                 continue;
             };
+            const active = self.active_tcp.fetchAdd(1, .acq_rel);
+            if (active >= self.config.max_tcp_connections) {
+                _ = self.active_tcp.fetchSub(1, .acq_rel);
+                stream.close(self.io);
+                continue;
+            }
             const t = std.Thread.spawn(.{}, connThread, .{ self, responder, stream }) catch {
+                _ = self.active_tcp.fetchSub(1, .acq_rel);
                 stream.close(self.io);
                 continue;
             };
@@ -352,16 +685,22 @@ pub const Server = struct {
     }
 
     fn connThread(self: *Server, responder: *const Responder, stream: Io.net.Stream) void {
-        defer stream.close(self.io);
-        var read_buf: [4096]u8 = undefined;
-        var reader = stream.reader(self.io, &read_buf);
+        defer {
+            _ = self.active_tcp.fetchSub(1, .acq_rel);
+            stream.close(self.io);
+        }
+        const timeout_ms: i32 = if (self.config.tcp_idle_seconds == 0)
+            -1
+        else
+            std.math.cast(i32, self.config.tcp_idle_seconds * 1000) orelse -1;
         while (true) {
             var lenbuf: [2]u8 = undefined;
-            readExact(&reader, &lenbuf) catch return;
+            readExact(stream.socket.handle, &lenbuf, timeout_ms) catch return;
             const len = (@as(usize, lenbuf[0]) << 8) | lenbuf[1];
             if (len < 12) return;
+            if (self.rate.enabled() and !self.rate.allow(self.gpa, stream.socket.address)) return;
             var qbuf: [65535]u8 = undefined;
-            readExact(&reader, qbuf[0..len]) catch return;
+            readExact(stream.socket.handle, qbuf[0..len], timeout_ms) catch return;
 
             var arena = std.heap.ArenaAllocator.init(self.gpa);
             defer arena.deinit();
@@ -370,9 +709,18 @@ pub const Server = struct {
                 self.writeTcpRcode(&stream, qbuf[0..len], 1);
                 continue;
             };
+            if (q.header.opcode() == 4) {
+                if (!q.header.qr()) self.handleNotifyTcp(&q, stream.socket.address, &stream);
+                continue;
+            }
             var tsig_req: ?tsig.Request = null;
             if (q.tsig()) |rr| {
-                tsig_req = tsig.verifyRequest(arena.allocator(), q.raw, rr, self.config.keys) catch |e| {
+                var ctx: tsig.VerifyContext = .{};
+                tsig_req = tsig.verifyRequest(arena.allocator(), q.raw, rr, self.config.keys, &ctx) catch |e| {
+                    if (e == error.BadTime and ctx.key != null and ctx.mac_valid) {
+                        self.writeTcpBadTime(&stream, qbuf[0..len], &ctx);
+                        continue;
+                    }
                     const rcode: u4 = switch (e) {
                         error.BadKey, error.BadMac, error.BadTime, error.MacTooShort, error.MacTooLong => 9,
                         else => 1,
@@ -380,6 +728,15 @@ pub const Server = struct {
                     self.writeTcpRcode(&stream, qbuf[0..len], rcode);
                     continue;
                 };
+                if (!self.replay.checkAndUpdate(self.gpa, ctx.key.?.name_wire, ctx.parsed.?.time_signed, ctx.parsed.?.fudge)) {
+                    self.writeTcpBadTime(&stream, qbuf[0..len], &ctx);
+                    continue;
+                }
+            }
+            if (q.header.opcode() == 5) {
+                const rcode = self.processUpdate(&q, stream.socket.address, if (tsig_req) |*r| r else null);
+                self.sendUpdateTcp(&stream, &q, rcode, if (tsig_req) |*r| r else null);
+                continue;
             }
             const reserve: usize = if (tsig_req != null) 512 else 0;
 
@@ -394,7 +751,10 @@ pub const Server = struct {
             switch (res) {
                 .message => |wire| {
                     if (tsig_req) |req| {
-                        const signed = tsig.appendResponse(arena.allocator(), &rbuf, wire.len, req.key, req.mac, req.original_id, false) catch {
+                        const signed = tsig.appendResponse(arena.allocator(), &rbuf, wire.len, req.key, .{
+                            .prior_mac = req.mac,
+                            .original_id = req.original_id,
+                        }) catch {
                             self.writeTcpRcode(&stream, qbuf[0..len], 2);
                             continue;
                         };
@@ -456,15 +816,11 @@ pub const Server = struct {
                 const sbuf = try self.gpa.alloc(u8, m.len + 512);
                 defer self.gpa.free(sbuf);
                 @memcpy(sbuf[0..m.len], m);
-                const signed = try tsig.appendResponse(
-                    self.gpa,
-                    sbuf,
-                    m.len,
-                    req.key,
-                    if (idx == 0) req.mac else prior_mac,
-                    req.original_id,
-                    idx != 0,
-                );
+                const signed = try tsig.appendResponse(self.gpa, sbuf, m.len, req.key, .{
+                    .prior_mac = if (idx == 0) req.mac else prior_mac,
+                    .original_id = req.original_id,
+                    .timers_only = idx != 0,
+                });
                 @memcpy(prior_buf[0..signed.mac_len], signed.mac[0..signed.mac_len]);
                 prior_mac = prior_buf[0..signed.mac_len];
                 try self.writeTcp(stream, sbuf[0..signed.len]);
@@ -489,14 +845,50 @@ pub const Server = struct {
         const len = self.buildError(&buf, query, rcode);
         self.writeTcp(stream, buf[0..len]) catch {};
     }
+
+    fn sendUdpBadTime(self: *Server, sock: *Io.net.Socket, to: Io.net.IpAddress, query: []const u8, ctx: *const tsig.VerifyContext) void {
+        var buf: [2048]u8 = undefined;
+        const len = self.buildError(&buf, query, 9);
+        const other = tsig.serverTime48();
+        const signed = tsig.appendResponse(self.gpa, &buf, len, ctx.key.?, .{
+            .prior_mac = ctx.parsed.?.mac,
+            .original_id = ctx.parsed.?.original_id,
+            .time_signed = ctx.parsed.?.time_signed,
+            .fudge = ctx.parsed.?.fudge,
+            .error_code = 18,
+            .other = &other,
+        }) catch return;
+        sock.send(self.io, &to, buf[0..signed.len]) catch {};
+    }
+
+    fn writeTcpBadTime(self: *Server, stream: *const Io.net.Stream, query: []const u8, ctx: *const tsig.VerifyContext) void {
+        var buf: [2048]u8 = undefined;
+        const len = self.buildError(&buf, query, 9);
+        const other = tsig.serverTime48();
+        const signed = tsig.appendResponse(self.gpa, &buf, len, ctx.key.?, .{
+            .prior_mac = ctx.parsed.?.mac,
+            .original_id = ctx.parsed.?.original_id,
+            .time_signed = ctx.parsed.?.time_signed,
+            .fudge = ctx.parsed.?.fudge,
+            .error_code = 18,
+            .other = &other,
+        }) catch return;
+        self.writeTcp(stream, buf[0..signed.len]) catch {};
+    }
 };
 
-fn readExact(reader: *Io.net.Stream.Reader, buf: []u8) !void {
+fn readExact(fd: std.posix.fd_t, buf: []u8, timeout_ms: i32) !void {
     var off: usize = 0;
     while (off < buf.len) {
-        const n = reader.interface.readSliceShort(buf[off..]) catch return error.ReadFailed;
-        if (n == 0) return error.EndOfStream;
-        off += n;
+        var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        const n = std.posix.poll(&fds, timeout_ms) catch return error.ReadFailed;
+        if (n == 0) return error.Timeout;
+        const rev = fds[0].revents;
+        if (rev & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0) return error.EndOfStream;
+        const r = std.c.recv(fd, @ptrCast(buf.ptr + off), buf.len - off, 0);
+        if (r == 0) return error.EndOfStream;
+        if (r < 0) return error.ReadFailed;
+        off += @intCast(r);
     }
 }
 
@@ -523,4 +915,10 @@ fn installReloadHandler() void {
         .flags = 0,
     };
     std.posix.sigaction(std.posix.SIG.HUP, &act, null);
+}
+
+fn nowMs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts) != 0) return 0;
+    return @as(u64, @intCast(@max(ts.sec, 0))) * 1000 + @as(u64, @intCast(@divTrunc(ts.nsec, 1_000_000)));
 }
