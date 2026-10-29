@@ -18,6 +18,7 @@ const EVP_MD = opaque {};
 const EVP_MD_CTX = opaque {};
 const EVP_PKEY_CTX = opaque {};
 const BIO = opaque {};
+const BIO_METHOD = opaque {};
 const ECDSA_SIG = opaque {};
 const BIGNUM = opaque {};
 
@@ -30,8 +31,17 @@ extern fn EVP_Digest(data: ?*const anyopaque, count: usize, md: ?[*]u8, size: ?*
 extern fn HMAC(md: ?*const EVP_MD, key: ?*const anyopaque, key_len: c_int, data: ?*const anyopaque, data_len: usize, md_out: ?[*]u8, out_len: ?*c_uint) ?[*]u8;
 
 extern fn BIO_new_mem_buf(buf: ?*const anyopaque, len: c_int) ?*BIO;
+extern fn BIO_new(type: ?*const BIO_METHOD) ?*BIO;
+extern fn BIO_s_mem() ?*const BIO_METHOD;
 extern fn BIO_free(bio: ?*BIO) c_int;
+extern fn BIO_ctrl(bio: *BIO, cmd: c_int, larg: c_long, parg: ?*anyopaque) c_long;
 extern fn PEM_read_bio_PrivateKey(bio: *BIO, x: ?*?*EVP_PKEY, cb: ?*anyopaque, u: ?*anyopaque) ?*EVP_PKEY;
+extern fn PEM_write_bio_PrivateKey(bio: *BIO, key: *EVP_PKEY, enc: ?*anyopaque, kstr: ?[*]u8, klen: c_int, cb: ?*anyopaque, u: ?*anyopaque) c_int;
+extern fn EVP_PKEY_CTX_new_id(id: c_int, engine: ?*anyopaque) ?*EVP_PKEY_CTX;
+extern fn EVP_PKEY_CTX_free(ctx: ?*EVP_PKEY_CTX) void;
+extern fn EVP_PKEY_keygen_init(ctx: *EVP_PKEY_CTX) c_int;
+extern fn EVP_PKEY_CTX_set_ec_paramgen_curve_nid(ctx: *EVP_PKEY_CTX, nid: c_int) c_int;
+extern fn EVP_PKEY_keygen(ctx: *EVP_PKEY_CTX, ppkey: *?*EVP_PKEY) c_int;
 extern fn EVP_PKEY_free(key: ?*EVP_PKEY) void;
 extern fn EVP_PKEY_is_a(key: *const EVP_PKEY, name: [*:0]const u8) c_int;
 extern fn EVP_PKEY_get_bits(key: *const EVP_PKEY) c_int;
@@ -68,6 +78,31 @@ pub const Algorithm = enum(u8) {
 
 pub fn version() []const u8 {
     return std.mem.span(OpenSSL_version(0));
+}
+
+/// OpenSSL object identifiers used for P-256 key generation.
+const EVP_PKEY_EC: c_int = 408;
+const NID_X9_62_prime256v1: c_int = 415;
+
+/// Generates a fresh P-256 private key and returns it as PEM (PKCS#8).
+/// Only libcrypto is used; no external `openssl` process is required.
+pub fn generateP256Pem(allocator: std.mem.Allocator) Error![]u8 {
+    const ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, null) orelse return error.OpenSsl;
+    defer EVP_PKEY_CTX_free(ctx);
+    if (EVP_PKEY_keygen_init(ctx) <= 0) return error.OpenSsl;
+    if (EVP_PKEY_CTX_set_ec_paramgen_curve_nid(ctx, NID_X9_62_prime256v1) <= 0) return error.OpenSsl;
+    var pkey: ?*EVP_PKEY = null;
+    if (EVP_PKEY_keygen(ctx, &pkey) <= 0) return error.OpenSsl;
+    defer EVP_PKEY_free(pkey);
+
+    const bio = BIO_new(BIO_s_mem()) orelse return error.OpenSsl;
+    defer _ = BIO_free(bio);
+    if (PEM_write_bio_PrivateKey(bio, pkey.?, null, null, 0, null, null) != 1) return error.OpenSsl;
+    var ptr: [*]u8 = undefined;
+    // BIO_CTRL_INFO (3) returns the memory BIO's buffer and length.
+    const len = BIO_ctrl(bio, 3, 0, @ptrCast(&ptr));
+    if (len <= 0) return error.OpenSsl;
+    return allocator.dupe(u8, ptr[0..@intCast(len)]);
 }
 
 pub fn digestSha256(data: []const u8, out: *[32]u8) Error!void {

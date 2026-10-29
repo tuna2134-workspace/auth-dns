@@ -169,7 +169,7 @@
 
 - `ksk-<unix>.pem` / `zsk-<unix>.pem` を列挙し、KSK(257)/ZSK(256) として読み込む。
 - 複数 ZSK がある間は全 ZSK で署名（DNSKEY にも全部公開）。
-- `dnssec-auto` 時は `openssl genpkey` で不足鍵を生成し、ZSK の寿命・伝播待ちを
+- `dnssec-auto` 時は libcrypto の EVP API で不足鍵を生成し、ZSK の寿命・伝播待ちを
   ファイル時刻から判断して追加・削除する。
 - サーバの 1 秒タイマーが鍵変更を検出すると、SOA シリアルを進めて再署名し、
   ジャーナル・ゾーンファイル・NOTIFY を更新する。

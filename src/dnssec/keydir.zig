@@ -51,8 +51,8 @@ pub fn ensureDir(io: Io, dir: []const u8) !void {
     try std.Io.Dir.cwd().createDirPath(io, dir);
 }
 
-/// Generates a P-256 private key with the OpenSSL CLI.  The core signing path
-/// still uses libcrypto directly; this is only key lifecycle management.
+/// Generates a P-256 private key with libcrypto and writes it as PEM with
+/// mode 0600.  No external `openssl` process is used.
 pub fn generate(allocator: std.mem.Allocator, io: Io, dir: []const u8, role: Role, timestamp: u64) ![]u8 {
     try ensureDir(io, dir);
     var ts = timestamp;
@@ -74,24 +74,31 @@ pub fn generate(allocator: std.mem.Allocator, io: Io, dir: []const u8, role: Rol
         ts += 1;
     }
     errdefer allocator.free(path);
-    const result = std.process.run(allocator, io, .{
-        .argv = &.{
-            "openssl",  "genpkey",                 "-algorithm", "EC",
-            "-pkeyopt", "ec_paramgen_curve:P-256", "-out",       path,
-        },
-    }) catch return error.KeyGenerationFailed;
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    switch (result.term) {
-        .exited => |code| if (code != 0) {
-            std.Io.Dir.cwd().deleteFile(io, path) catch {};
-            return error.KeyGenerationFailed;
-        },
-        else => {
-            std.Io.Dir.cwd().deleteFile(io, path) catch {};
-            return error.KeyGenerationFailed;
-        },
-    }
+
+    const pem = openssl.generateP256Pem(allocator) catch {
+        std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        return error.KeyGenerationFailed;
+    };
+    defer allocator.free(pem);
+
+    var file = std.Io.Dir.cwd().createFile(io, path, .{
+        .exclusive = true,
+        .permissions = std.Io.File.Permissions.fromMode(0o600),
+    }) catch |e| {
+        std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        return e;
+    };
+    defer file.close(io);
+    var wbuf: [4096]u8 = undefined;
+    var w = file.writer(io, &wbuf);
+    w.interface.writeAll(pem) catch |e| {
+        std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        return e;
+    };
+    w.interface.flush() catch |e| {
+        std.Io.Dir.cwd().deleteFile(io, path) catch {};
+        return e;
+    };
     return path;
 }
 

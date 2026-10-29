@@ -54,8 +54,9 @@ auth-dns serve -l 127.0.0.1:5353 -z example.com=example.com.zone \
   --dnssec-propagation 3600
 ```
 
-`dnssec-auto` は鍵が無ければ `openssl genpkey` で P-256 の KSK/ZSK を生成します。
-署名・検証そのものは libcrypto を直接使います。`openssl` コマンドは鍵生成時だけ必要です。
+`dnssec-auto` は鍵が無ければ libcrypto の EVP API（P-256）で KSK/ZSK を生成し、
+0600 の PEM として鍵ディレクトリへ書き込みます。署名・検証・鍵生成のすべてが
+libcrypto 内で完結し、外部の `openssl` コマンドは不要です。
 
 ## 自動 RRSIG 更新
 
@@ -134,6 +135,5 @@ chown -R auth-dns:auth-dns /etc/auth-dns/keys
 
 - 親 DS の自動更新、CDS/CDNSKEY の公開・処理は未実装。
 - KSK の自動ロールオーバーは未実装（DS 待ちの状態管理が必要）。
-- 鍵生成は `openssl` コマンドに依存。
 - 自動再署名はゾーンファイルを書き換えます。読み取り専用のマウントでは使えません。
 - 秘密鍵は 0600、専用ユーザー所有とし、Git やコンテナイメージに含めないでください。

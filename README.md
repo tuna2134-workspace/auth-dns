@@ -145,7 +145,7 @@ zone "example.com" {
 
 - `listen` は複数指定できます。`127.0.0.1 port 15353` でも `127.0.0.1:15353` でも可。
 - `directory` は `file` / `journal` / `dnssec-key` / `dnssec-key-dir` の相対パスの基準です。
-- `dnssec-auto` は `openssl` コマンドで P-256 鍵を生成します（署名自体は libcrypto）。
+- `dnssec-auto` は libcrypto の EVP API で P-256 鍵を生成します（外部コマンド不要）。
 - `allow-transfer` は先勝ちです。`any`, `none`, IPv4/IPv6 アドレス、CIDR、`key "name"` を指定できます。
 - デフォルトの `allow-transfer` は **none** です。
 - `type` は `primary` / `secondary`。セカンダリは
@@ -401,7 +401,6 @@ DNSSEC 鍵更新の自動化（RRSIG 更新・ZSK ロールオーバー・KSK/DS
 
 - **DoT/DoH**: 現状は UDP/TCP のみ。TLS が必要なら libssl を追加し、`libcrypto` は
   そのまま使えます。`libssl` は TLS 終端のためだけに必要です。
-- **自動鍵生成**: `dnssec-auto` は鍵生成に `openssl` コマンドを使います。
 - **NSEC3 Opt-Out のワイルドカード**: BIND 互換のため Opt-Out チェーンの全 NSEC3 に
   flag を立てています。Opt-Out 区間で覆われるワイルドカード回答は、検証器によって
   unsigned 扱いになることがあります（DS/NXDOMAIN の Opt-Out 証明は検証済み）。
