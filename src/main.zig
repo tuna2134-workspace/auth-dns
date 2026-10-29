@@ -62,8 +62,14 @@ fn cmdServe(init: std.process.Init, argv: []const []const u8) !void {
     var allow_text: []const u8 = "none";
     var allow_update_text: []const u8 = "none";
     var dnssec_key: ?[]const u8 = null;
+    var dnssec_key_dir: ?[]const u8 = null;
+    var dnssec_auto: bool = false;
+    var dnssec_resign_interval: u32 = 7 * 24 * 3600;
+    var dnssec_zsk_lifetime: u32 = 90 * 24 * 3600;
+    var dnssec_propagation: u32 = 3600;
     var dnssec_flags: u16 = 257;
     var dnssec_nsec3: bool = false;
+    var dnssec_nsec3_opt_out: bool = false;
     var dnssec_nsec3_iterations: u16 = 0;
     var dnssec_nsec3_salt: []const u8 = "";
     var journal_dir: ?[]const u8 = null;
@@ -103,10 +109,22 @@ fn cmdServe(init: std.process.Init, argv: []const []const u8) !void {
             allow_update_text = try nextArg(argv, &i, a);
         } else if (std.mem.eql(u8, a, "--dnssec-key")) {
             dnssec_key = try nextArg(argv, &i, a);
+        } else if (std.mem.eql(u8, a, "--dnssec-key-dir")) {
+            dnssec_key_dir = try nextArg(argv, &i, a);
+        } else if (std.mem.eql(u8, a, "--dnssec-auto")) {
+            dnssec_auto = true;
+        } else if (std.mem.eql(u8, a, "--dnssec-resign-interval")) {
+            dnssec_resign_interval = std.fmt.parseInt(u32, try nextArg(argv, &i, a), 10) catch 7 * 24 * 3600;
+        } else if (std.mem.eql(u8, a, "--dnssec-zsk-lifetime")) {
+            dnssec_zsk_lifetime = std.fmt.parseInt(u32, try nextArg(argv, &i, a), 10) catch 90 * 24 * 3600;
+        } else if (std.mem.eql(u8, a, "--dnssec-propagation")) {
+            dnssec_propagation = std.fmt.parseInt(u32, try nextArg(argv, &i, a), 10) catch 3600;
         } else if (std.mem.eql(u8, a, "--dnssec-flags")) {
             dnssec_flags = std.fmt.parseInt(u16, try nextArg(argv, &i, a), 10) catch 257;
         } else if (std.mem.eql(u8, a, "--dnssec-nsec3")) {
             dnssec_nsec3 = true;
+        } else if (std.mem.eql(u8, a, "--dnssec-nsec3-opt-out")) {
+            dnssec_nsec3_opt_out = true;
         } else if (std.mem.eql(u8, a, "--dnssec-nsec3-iterations")) {
             dnssec_nsec3_iterations = std.fmt.parseInt(u16, try nextArg(argv, &i, a), 10) catch 0;
         } else if (std.mem.eql(u8, a, "--dnssec-nsec3-salt")) {
@@ -190,11 +208,17 @@ fn cmdServe(init: std.process.Init, argv: []const []const u8) !void {
     for (zones.items) |*zs| {
         zs.allow_transfer = transfer_acl;
         zs.allow_update = update_acl;
-        if (dnssec_key) |k| {
+        if (dnssec_key != null or dnssec_key_dir != null) {
             zs.dnssec = .{
-                .key_path = k,
+                .key_path = dnssec_key,
+                .key_dir = dnssec_key_dir,
+                .auto = dnssec_auto,
+                .resign_interval = dnssec_resign_interval,
+                .zsk_lifetime = dnssec_zsk_lifetime,
+                .propagation = dnssec_propagation,
                 .key_flags = dnssec_flags,
                 .nsec3 = dnssec_nsec3,
+                .nsec3_opt_out = dnssec_nsec3_opt_out,
                 .nsec3_iterations = dnssec_nsec3_iterations,
                 .nsec3_salt = dnssec_nsec3_salt,
             };
@@ -284,7 +308,10 @@ fn cmdCheckZone(init: std.process.Init, argv: []const []const u8) !void {
     var origin: ?name.Name = null;
     var file: ?[]const u8 = null;
     var dnssec_key: ?[]const u8 = null;
+    var dnssec_key_dir: ?[]const u8 = null;
+    var auto = false;
     var nsec3_enabled = false;
+    var nsec3_opt_out = false;
     var nsec3_iterations: u16 = 0;
     var nsec3_salt: []const u8 = "";
 
@@ -302,8 +329,14 @@ fn cmdCheckZone(init: std.process.Init, argv: []const []const u8) !void {
             file = try nextArg(argv, &i, a);
         } else if (std.mem.eql(u8, a, "--dnssec-key")) {
             dnssec_key = try nextArg(argv, &i, a);
+        } else if (std.mem.eql(u8, a, "--dnssec-key-dir")) {
+            dnssec_key_dir = try nextArg(argv, &i, a);
+        } else if (std.mem.eql(u8, a, "--dnssec-auto")) {
+            auto = true;
         } else if (std.mem.eql(u8, a, "--dnssec-nsec3")) {
             nsec3_enabled = true;
+        } else if (std.mem.eql(u8, a, "--dnssec-nsec3-opt-out")) {
+            nsec3_opt_out = true;
         } else if (std.mem.eql(u8, a, "--dnssec-nsec3-iterations")) {
             nsec3_iterations = std.fmt.parseInt(u16, try nextArg(argv, &i, a), 10) catch 0;
         } else if (std.mem.eql(u8, a, "--dnssec-nsec3-salt")) {
@@ -320,9 +353,12 @@ fn cmdCheckZone(init: std.process.Init, argv: []const []const u8) !void {
 
     var z = sema.load(gpa, init.io, file.?, .{
         .origin = origin.?,
-        .dnssec = if (dnssec_key) |k| .{
-            .key_path = k,
+        .dnssec = if (dnssec_key != null or dnssec_key_dir != null) .{
+            .key_path = dnssec_key,
+            .key_dir = dnssec_key_dir,
+            .auto = auto,
             .nsec3 = nsec3_enabled,
+            .nsec3_opt_out = nsec3_opt_out,
             .nsec3_iterations = nsec3_iterations,
             .nsec3_salt = nsec3_salt,
         } else null,
@@ -364,7 +400,9 @@ fn printUsage(init: std.process.Init) void {
         \\  auth-dns serve --config named.conf
         \\  auth-dns serve [options]
         \\  auth-dns checkzone --origin NAME --file FILE [--dnssec-key PEM]
-        \\      [--dnssec-nsec3] [--dnssec-nsec3-iterations N] [--dnssec-nsec3-salt HEX]
+        \\      [--dnssec-key-dir DIR] [--dnssec-auto]
+        \\      [--dnssec-nsec3] [--dnssec-nsec3-opt-out]
+        \\      [--dnssec-nsec3-iterations N] [--dnssec-nsec3-salt HEX]
         \\  auth-dns ds --key PEM --name NAME [--flags 257]
         \\  auth-dns version
         \\
@@ -374,8 +412,14 @@ fn printUsage(init: std.process.Init) void {
         \\      --allow-transfer ACL     ACL list, e.g. "127.0.0.1,192.0.2.0/24,key:xfr"
         \\      --allow-update ACL       ACL list for RFC 2136 dynamic updates
         \\      --dnssec-key PEM         sign every zone with this private key
+        \\      --dnssec-key-dir DIR     load ksk-*.pem / zsk-*.pem from DIR
+        \\      --dnssec-auto            generate keys and roll the ZSK automatically
+        \\      --dnssec-resign-interval SECONDS
+        \\      --dnssec-zsk-lifetime SECONDS
+        \\      --dnssec-propagation SECONDS
         \\      --dnssec-flags N         DNSKEY flags (default 257)
         \\      --dnssec-nsec3           generate an NSEC3 chain (instead of NSEC)
+        \\      --dnssec-nsec3-opt-out   NSEC3 Opt-Out (omit insecure delegations)
         \\      --dnssec-nsec3-iterations N
         \\      --dnssec-nsec3-salt HEX  NSEC3 salt (hex)
         \\      --journal-dir DIR        enable IXFR journals under DIR

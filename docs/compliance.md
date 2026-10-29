@@ -88,6 +88,8 @@
 - 応答 MAC: リクエスト MAC（u16 長 + 値）+ メッセージ + TSIG 変数。
 - AXFR/IXFR の 2 通目以降: 直前の MAC + メッセージ + time/fudge のみ。
 - 成功時の検証・署名を実装。MAC 不一致/未知鍵は NOTAUTH を返す（TSIG なし）。
+- セカンダリは XFR 要求を TSIG 署名し、応答 MAC を検証（AXFR/IXFR の MAC 連鎖を含む）。
+- NOTIFY も TSIG 署名・検証に対応。応答はリクエスト MAC で署名する。
 - BADTIME は署名付き NOTAUTH（TSIG Error 18、Other Data にサーバ時刻）を返す。
 - 鍵ごとの最新 Time Signed を保持し、fudge より古いリクエストをリプレイとして拒否。
 
@@ -117,13 +119,17 @@
   - NSEC3PARAM（alg 1, flags 0, iterations, salt）と NSEC3 チェーンを生成。
   - NSEC3 は ENT を含む全権威名をハッシュ化。ENT の type bitmap は空。
   - NODATA/NXDOMAIN/ワイルドカード/委任 DS 不在の NSEC3 否定証明。
-  - opt-out は未実装。
+  - Opt-Out: insecure delegation をチェーンから省略し、NSEC3 に Opt-Out フラグを設定。
+    DS 不在は covering NSEC3 + closest provable encloser で証明。
+  - BIND 互換のため Opt-Out チェーンの全 NSEC3 にフラグを設定する。この区間に入る
+    ワイルドカード回答は検証器で unsigned 扱いになる場合がある。
 
 ## トランスポート
 
 - **RFC 7766**: TCP は 2 バイト長プレフィックス、複数クエリ、接続再利用に対応。
   接続ごとにスレッドを立て、応答は逐次。
-- アイドルタイムアウト、同時接続数制限、パイプラインの並列応答は未実装。
+- アイドルタイムアウト、同時接続数制限、送信元ごとのレート制限を実装。
+  パイプラインの並列応答は未実装。
 - UDP は 1 データグラム 1 クエリ。EDNS のサイズに従って TC を設定。
 
 ## 実装済みの拡張
@@ -131,7 +137,8 @@
 - Dynamic Update（RFC 2136）: prerequisite、add、delete、delete-RRset、delete-name。
   TSIG/ACL、SOA シリアル更新、ジャーナル、DNSSEC 再署名、ゾーンファイル永続化。
 - セカンダリ: AXFR/IXFR クライアント、SOA refresh、NOTIFY 受信、NOTIFY 送信。
-- NSEC3 / NSEC3PARAM の署名生成と否定証明（opt-out を除く）。
+- NSEC3 / NSEC3PARAM の署名生成と否定証明（Opt-Out 含む）。
+- セカンダリの TSIG 付き XFR 要求・応答検証、TSIG 付き NOTIFY。
 - SVCB/HTTPS の主要パラメータのテキスト形式。
 - TCP アイドルタイムアウト、同時接続数制限、送信元ごとのレート制限。
 - TSIG BADTIME の署名付き応答と簡易リプレイキャッシュ。
@@ -139,8 +146,6 @@
 ## 意図的な未実装
 
 - IQUERY（RFC 3425 で廃止）
-- NSEC3 opt-out
-- セカンダリからプライマリへの TSIG 付き XFR リクエスト
 - DoT/DoH（libssl が必要）
 - ビュー、RPZ、カタログゾーン、DNSSEC オンライン署名
-- DNSSEC 鍵の自動ロールオーバー（設計のみ）
+- KSK の自動ロールオーバー / 親 DS 更新 / CDS-CDNSKEY（RRSIG 更新と ZSK ロールオーバーは実装済み）

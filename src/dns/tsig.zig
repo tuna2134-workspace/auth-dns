@@ -22,6 +22,7 @@ pub const Error = error{
     MacTooShort,
     MacTooLong,
     TsigNotLast,
+    TsigError,
     NoSpace,
 } || name.Error || openssl.Error;
 
@@ -163,10 +164,68 @@ pub fn verifyRequest(
     };
 }
 
+/// Verifies the TSIG on a server response.  `prior_mac` is the request MAC for
+/// the first message, or the previous response MAC for AXFR/IXFR continuation.
+pub fn verifyResponse(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    rr: message.Record,
+    key: *const Key,
+    prior_mac: []const u8,
+    timers_only: bool,
+) Error!Parsed {
+    const parsed = try parse(rr);
+    if (parsed.err_code != 0) return error.TsigError;
+    const hdr = message.Header.parse(raw) catch return error.BadRdata;
+    if (parsed.original_id != hdr.id) return error.BadOriginalId;
+    const end = rr.rdata_offset + rr.rdata.len;
+    if (end != raw.len) return error.TsigNotLast;
+    if (!wireEqlIgnoreCase(parsed.key_name.slice(), key.name_wire)) return error.BadKey;
+    if (!wireEqlIgnoreCase(parsed.algorithm_name.slice(), key.algorithm_wire)) return error.BadKey;
+
+    const unsigned = try allocator.dupe(u8, raw[0..rr.name_offset]);
+    defer allocator.free(unsigned);
+    const old_arc = readU16(unsigned, 10);
+    if (old_arc == 0) return error.BadRdata;
+    writeU16(unsigned, 10, old_arc - 1);
+
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(allocator);
+    try appendU16(&input, allocator, @intCast(prior_mac.len));
+    try input.appendSlice(allocator, prior_mac);
+    try input.appendSlice(allocator, unsigned);
+    if (timers_only) {
+        try appendU48(&input, allocator, parsed.time_signed);
+        try appendU16(&input, allocator, parsed.fudge);
+    } else {
+        try appendVariables(&input, allocator, key, parsed.time_signed, parsed.fudge, parsed.err_code, parsed.other);
+    }
+    var mac: [64]u8 = undefined;
+    const mac_len = try openssl.hmac(key.algorithm_text, key.secret, input.items, &mac);
+    if (parsed.mac.len > mac_len) return error.BadMac;
+    if (parsed.mac.len < @max(10, mac_len / 2)) return error.MacTooShort;
+    var diff: u8 = 0;
+    for (parsed.mac, 0..) |b, i| diff |= b ^ mac[i];
+    if (diff != 0) return error.BadMac;
+    if (!withinFudge(currentTime(), parsed.time_signed, parsed.fudge)) return error.BadTime;
+    return parsed;
+}
+
 fn withinFudge(now: u64, signed: u64, fudge: u16) bool {
     const f: u64 = fudge;
     if (now >= signed) return now - signed <= f;
     return signed - now <= f;
+}
+
+/// Signs a client request (no prior MAC).
+pub fn appendRequest(
+    allocator: std.mem.Allocator,
+    buf: []u8,
+    len: usize,
+    key: *const Key,
+    original_id: u16,
+) Error!Signed {
+    return appendResponse(allocator, buf, len, key, .{ .original_id = original_id });
 }
 
 /// Appends a TSIG RR to `buf[0..len]`.  `buf` must have room; the message
@@ -204,6 +263,7 @@ pub fn appendResponse(
 ) Error!Signed {
     const now = opts.time_signed orelse currentTime();
     const fudge = opts.fudge;
+    if (opts.other.len > 65535) return error.BadRdata;
 
     var rdata: std.ArrayList(u8) = .empty;
     defer rdata.deinit(allocator);
@@ -238,6 +298,7 @@ pub fn appendResponse(
     try appendU16(&rdata, allocator, @intCast(opts.other.len));
     try rdata.appendSlice(allocator, opts.other);
 
+    if (rdata.items.len > 65535) return error.BadRdata;
     const rr_len = key.name_wire.len + 10 + rdata.items.len;
     if (len + rr_len > buf.len or len + rr_len > 65535) return error.NoSpace;
     @memcpy(buf[len..][0..key.name_wire.len], key.name_wire);

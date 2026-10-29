@@ -10,7 +10,10 @@ const openssl = @import("../dnssec/openssl.zig");
 
 pub const Params = struct {
     algorithm: u8 = 1,
+    /// Flags published in NSEC3PARAM (normally 0).
     flags: u8 = 0,
+    /// RFC 5155 Opt-Out.  The flag appears in NSEC3 RRs, not NSEC3PARAM.
+    opt_out: bool = false,
     iterations: u16 = 0,
     salt: []const u8 = &.{},
 };
@@ -78,6 +81,7 @@ pub fn paramsFromRdata(rdata: []const u8) ?Params {
     return .{
         .algorithm = rdata[0],
         .flags = rdata[1],
+        .opt_out = (rdata[1] & 0x01) != 0,
         .iterations = (@as(u16, rdata[2]) << 8) | rdata[3],
         .salt = rdata[5 .. 5 + salt_len],
     };

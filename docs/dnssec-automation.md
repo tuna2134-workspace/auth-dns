@@ -1,181 +1,139 @@
-# DNSSEC 鍵更新の自動化
+# DNSSEC 署名更新と ZSK ロールオーバー
 
 ## 結論
 
-**署名（RRSIG）の更新と ZSK のロールオーバーは自動化できます。**
-**KSK のロールオーバーは、ゾーン側の準備までなら自動化できますが、最後の親ゾーンの DS 更新だけは
-この権威サーバの外側の操作**（レジストラ API、親ゾーン管理者、RFC 8078 の CDS を消費する親など）
-が必要です。したがって「完全に自己完結した全自動」は、親が CDS/CDNSKEY を自動処理しない限り無理です。
+**RRSIG の定期更新と ZSK ロールオーバーは、サーバ内で自動化されています。**
+**KSK のロールオーバーは、最後の親 DS の更新だけがサーバ外の操作**になります。
+親が CDS/CDNSKEY（RFC 8078）を自動処理しない限り、レジストラ API か手動対応が必要です。
 
 | 項目 | 自動化 | 親ゾーン操作 |
 |---|---|---|
-| RRSIG の再署名 | 可能 | 不要 |
-| ZSK ロールオーバー | 可能 | 不要（DS は KSK を指す） |
-| KSK の事前公開・二重署名 | 可能 | 不要 |
-| 親 DS の切り替え | 条件付き | **必要** |
-| KSK の退役 | 可能 | DS 切り替え後 |
-| 鍵生成 | 可能（OpenSSL） | 不要 |
+| RRSIG の再署名 | 自動 | 不要 |
+| ZSK の事前公開・二重署名・退役 | 自動 | 不要 |
+| KSK の生成・公開 | 自動 | 不要 |
+| 親 DS の切り替え | 未対応 | **必要** |
+| CDS/CDNSKEY の公開 | 未対応 | — |
 
-## 現状の実装
-
-- `dnssec-key` / `--dnssec-key` で指定した **1 つの秘密鍵**を読み、ゾーンロード時に署名します。
-- `validity` の既定値は 30 日です。
-- `SIGHUP` でゾーンを再読み込みすると、同じ鍵で署名し直します。
-- 自動タイマー、複数鍵、鍵ディレクトリ、CDS/CDNSKEY、親 DS 更新フックは未実装です。
-- 同じ SOA シリアルで RRSIG だけが変わった再署名では、IXFR ジャーナルを保持するように
-  しています。ただしセカンダリは SOA が同じだとリフレッシュで転送を要求しないため、
-  新しい RRSIG を IXFR で配るにはシリアルを進める設計が必要です。
-- 同じシリアルで RRSIG 以外のデータが変わった場合は、IXFR で表現できないため
-  ジャーナルを破棄します。
-
-## 提案する構成
-
-### 鍵ディレクトリ
+## 鍵ディレクトリ
 
 ```text
 keys/example.com/
-  ksk-2026-01.pem       # flags 257 (SEP + Zone Key)
-  ksk-2026-10.pem       # ロールオーバー中のみ
-  zsk-2026-01.pem       # flags 256 (Zone Key)
-  zsk-2026-04.pem       # ロールオーバー中のみ
-  state                 # フェーズ、時刻、DS 待ち状態
+  ksk-1793280000.pem    # flags 257 (SEP + Zone Key)
+  zsk-1793280000.pem    # flags 256 (Zone Key)
+  zsk-1793280400.pem    # ロールオーバー中のみ（新 ZSK）
 ```
 
-- ファイル名の `ksk-` / `zsk-` でロールを判定。
-- サーバはディレクトリ内の **公開中の全鍵**で署名します。
-- DNSKEY RRset は KSK 群で、通常の RRset は ZSK 群で署名します（複数なら複数 RRSIG）。
-- ロールオーバー中は新旧両方で署名し、DNSKEY にも両方を公開します。
+- ファイル名の `ksk-` / `zsk-` と Unix 時刻でロールと世代を判定。
+- サーバはディレクトリ内の **公開中の全鍵**を読み、DNSKEY にすべて公開。
+- DNSKEY RRset は KSK 群、通常 RRset と NSEC/NSEC3 は ZSK 群で署名。
+- ロールオーバー中は新旧 ZSK の両方で署名するため、各 RRset に複数の RRSIG が付く。
 
-### 状態機械
+設定:
 
-```text
-idle
-  -> zsk-prepublished    新 ZSK を追加、旧+新で署名
-  -> zsk-active          旧 ZSK を削除
-  -> idle
+```conf
+zone "example.com" {
+    type primary;
+    file "example.com.zone";
 
-idle
-  -> ksk-prepublished    新 KSK を追加、DNSKEY RRset を旧+新で署名
-  -> ds-pending          親 DS の更新待ち（CDS/CDNSKEY を公開）
-  -> ksk-active          旧 KSK を削除
-  -> idle
+    dnssec-key-dir "keys/example.com";
+    dnssec-auto yes;
+
+    dnssec-resign-interval 7d;   # RRSIG 再署名
+    dnssec-zsk-lifetime   90d;   # 新 ZSK を出す間隔
+    dnssec-propagation    1h;    # 旧 ZSK を残す時間
+};
 ```
 
-### タイミング
+CLI:
 
-TTL を `T` とします。
+```sh
+auth-dns serve -l 127.0.0.1:5353 -z example.com=example.com.zone \
+  --dnssec-key-dir keys/example.com --dnssec-auto \
+  --dnssec-resign-interval 604800 \
+  --dnssec-zsk-lifetime 7776000 \
+  --dnssec-propagation 3600
+```
 
-| フェーズ | 待ち時間 | 理由 |
-|---|---|---|
-| 新 DNSKEY の事前公開 | `max(2T, 1h)` | キャッシュされた DNSKEY を更新 |
-| ZSK の二重署名 | `max(2T, 1h)` | 旧署名のキャッシュ切れ |
-| KSK の DS 切り替え | 旧 DS の TTL | 古い DS を持つリゾルバの更新 |
-| 旧 KSK の削除 | 新 DS の TTL | 新 DS の伝播 |
-| RRSIG 再署名 | 有効期限の 1/3 前 | 期限切れ防止 |
+`dnssec-auto` は鍵が無ければ `openssl genpkey` で P-256 の KSK/ZSK を生成します。
+署名・検証そのものは libcrypto を直接使います。`openssl` コマンドは鍵生成時だけ必要です。
 
-## RRSIG の自動更新
+## 自動 RRSIG 更新
 
-1. タイマー（例: 毎日）で `auth-dns` を再読み込みし、同じ鍵で再署名。
-2. 有効期限が近い場合だけ再署名する（`validity` と最終署名時刻を状態ファイルに保存）。
-3. セカンダリにも配る場合は、SOA シリアルを 1 進めてから署名し、IXFR ジャーナルに
-   RRSIG の差分を含める。シリアルを進めない場合、セカンダリは SOA が同じため
-   リフレッシュで転送を要求せず、古い RRSIG を期限まで保持する。
+1. サーバは 1 秒ごとにメンテナンス時刻を確認。
+2. `last_sign_ms` から `dnssec-resign-interval` 経過したら再署名。
+3. 現在のゾーンから DNSSEC レコード（DNSKEY/RRSIG/NSEC/NSEC3/NSEC3PARAM）を除いた
+   データを一時ファイルへ書き、SOA シリアルを 1 進める。
+4. `sema.load` で再検証・再署名し、ジャーナルへ差分を追加、ゾーンファイルを
+   アトミックに置換、`also-notify` へ NOTIFY を送る。
+5. セカンダリは新しいシリアルを IXFR で取得し、新しい RRSIG を受け取る。
 
-現実的な運用は次のどちらかです。
-
-- **プライマリのみ**: シリアルを進めずに再署名（セカンダリは AXFR 時に更新）。
-- **セカンダリあり**: 再署名時にシリアルを進め、IXFR で RRSIG 差分を配る。
+シリアルを進めるため、RRSIG 更新が IXFR/NOTIFY でセカンダリへ伝播します。
 
 ## ZSK ロールオーバー
 
-1. 新しい ZSK を生成し、鍵ディレクトリに追加。
-2. `SIGHUP` で再読み込み。DNSKEY に新 ZSK、各 RRset に旧+新の RRSIG。
-3. `2T` 待つ。
-4. 旧 ZSK を削除して `SIGHUP`。
-5. 親 DS は変更不要（DS は KSK を指す）。
+サーバは鍵ディレクトリの時刻だけで状態を判断します（状態ファイル不要）。
 
-## KSK ロールオーバー
+```text
+最新 ZSK の経過時間 < zsk-lifetime
+  -> そのまま
 
-1. 新しい KSK を生成し、鍵ディレクトリに追加。
-2. `SIGHUP`。DNSKEY RRset を旧+新 KSK で署名。
-3. 親ゾーンに新しい DS を登録する。自動化する場合は CDS/CDNSKEY（RFC 8078）を
-   公開し、親がそれを処理できる必要がある。
-4. 旧 DS の TTL 以上待つ。
-5. 旧 KSK を削除して `SIGHUP`。
-6. 新しい DS の TTL 以上待って完了。
+最新 ZSK の経過時間 >= zsk-lifetime
+  -> 新しい zsk-<now>.pem を生成
+  -> 旧+新 ZSK で再署名（DNSKEY に両方、各 RRset に 2 つの RRSIG）
+  -> SOA シリアル更新 + NOTIFY
 
-親が CDS を自動処理しない場合、3 はレジストラ API 呼び出し、または手動になります。
-この部分だけは「サーバ内で完結」できません。
+最新 ZSK の経過時間 >= propagation かつ旧 ZSK が残っている
+  -> 旧 ZSK ファイルを削除
+  -> 新 ZSK だけで再署名
+```
 
-## systemd での運用例
+- `propagation` は「旧 DNSKEY/RRSIG がリゾルバキャッシュから消えるまで」の待ち時間。
+- 目安は `max(2 * TTL, 1h)`。既定は 1 時間。
+- ZSK の期限切れで緊急に切り替える場合も、この 2 段階を踏むため検証切れを避けられます。
+
+## KSK
+
+- KSK が無ければ自動生成し、DNSKEY RRset を KSK で署名。
+- KSK のロールオーバーは未実装。親 DS の更新が必要なためです。
+- 手動で KSK を追加する場合は、新しい `ksk-<timestamp>.pem` を置いて SIGHUP すると
+  新旧 KSK で DNSKEY RRset を二重署名します。親 DS の切り替え後に旧 KSK を削除します。
+
+## 単鍵モード
+
+`dnssec-key` / `--dnssec-key` は従来の単鍵モードです。同じ鍵を KSK(257) と ZSK(256)
+として公開します。自動更新・ロールオーバーは行いません。自動運用には
+`dnssec-key-dir` + `dnssec-auto` を使ってください。
+
+## systemd
+
+サーバ内スケジューラを使うため、追加のタイマーは不要です。
 
 ```ini
-# /etc/systemd/system/auth-dns.service
 [Service]
 ExecStart=/usr/local/bin/auth-dns serve -c /etc/auth-dns/auth-dns.conf
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 ```
 
-```ini
-# /etc/systemd/system/auth-dns-dnssec.service
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/auth-dns-dnssec-maintain --config /etc/auth-dns/auth-dns.conf
+鍵ディレクトリはサーバユーザーだけが読めるようにします。
+
+```sh
+install -d -m 700 /etc/auth-dns/keys/example.com
+chown -R auth-dns:auth-dns /etc/auth-dns/keys
 ```
 
-```ini
-# /etc/systemd/system/auth-dns-dnssec.timer
-[Timer]
-OnCalendar=daily
-Persistent=true
-[Install]
-WantedBy=timers.target
-```
+## 監視
 
-`auth-dns-dnssec-maintain` は次を行います。
+- `dig +dnssec DNSKEY` に KSK と ZSK が両方出るか。
+- 各 RRset に有効な RRSIG があるか（`delv` / `dnssec-verify`）。
+- `dig SOA` のシリアルが再署名で進んでいるか。
+- 鍵ディレクトリに `zsk-*` が 2 つ残り続けていないか（伝播待ちの滞留）。
+- RRSIG の expiration が十分先か。
 
-- 署名期限の確認と再署名（必要ならシリアル更新）
-- ZSK の寿命確認と段階的なロールオーバー
-- KSK の寿命確認、CDS/CDNSKEY の公開、DS 待ち状態の管理
-- 状態ファイルのアトミック更新とバックアップ
-- 失敗時は旧鍵を残したままアラート
+## 制限
 
-## CDS / CDNSKEY
-
-KSK ロールオーバーを親に通知するには、子ゾーンに以下を公開します。
-
-```text
-CDS      <keytag> <algorithm> 2 <sha256>
-CDNSKEY  <flags> 3 <algorithm> <public key>
-```
-
-親が RFC 8078 に対応していれば、DS 更新を自動化できます。
-対応していない場合は、レジストラ API や親ゾーン管理者への通知が必要です。
-
-## 実装フェーズ案
-
-1. **鍵ディレクトリ + 複数鍵署名**
-   - `dnssec-key-dir`
-   - KSK/ZSK の役割
-   - 複数 RRSIG / 複数 DNSKEY
-2. **メンテナンス CLI**
-   - `auth-dns dnssec status`
-   - `auth-dns dnssec resign`
-   - `auth-dns dnssec rollover-zsk`
-   - `auth-dns dnssec rollover-ksk`
-3. **CDS/CDNSKEY と親フック**
-   - `--parent-hook`（レジストラ API 呼び出し）
-   - DS 反映待ちの状態管理
-4. **監視**
-   - RRSIG 残り時間
-   - DS と DNSKEY の一致
-   - ロールオーバー滞留アラート
-
-## セキュリティ
-
-- 秘密鍵は 0600、専用ユーザー所有。
-- 可能なら KSK はオフライン/HSM に置き、ZSK だけをオンラインにする。
-- 鍵ディレクトリを Git やコンテナイメージに含めない。
-- 状態ファイルと鍵のバックアップを取る。
-- ロールオーバー中は旧鍵をすぐ消さない。
+- 親 DS の自動更新、CDS/CDNSKEY の公開・処理は未実装。
+- KSK の自動ロールオーバーは未実装（DS 待ちの状態管理が必要）。
+- 鍵生成は `openssl` コマンドに依存。
+- 自動再署名はゾーンファイルを書き換えます。読み取り専用のマウントでは使えません。
+- 秘密鍵は 0600、専用ユーザー所有とし、Git やコンテナイメージに含めないでください。

@@ -41,6 +41,10 @@ pub const BuildError = error{
     OutOfZone,
     BadWildcard,
     TooManyRecords,
+    BadTtl,
+    RdataTooLong,
+    WrongClass,
+    MetaType,
 } || std.mem.Allocator.Error;
 
 pub const Zone = struct {
@@ -88,6 +92,12 @@ pub const Zone = struct {
 
         const recs = try a.alloc(Record, raw.len);
         for (raw, 0..) |r, i| {
+            if (r.ttl > 0x7fffffff) return error.BadTtl;
+            if (r.rdata.len > 65535) return error.RdataTooLong;
+            if (r.class != class) return error.WrongClass;
+            if (types.isMetaType(r.rtype)) return error.MetaType;
+            const owner_name = name.Name.init(r.owner) catch return error.OutOfZone;
+            if (!owner_name.isSubdomainOf(&origin)) return error.OutOfZone;
             recs[i] = .{
                 .owner = try a.dupe(u8, r.owner),
                 .rtype = r.rtype,
@@ -199,10 +209,27 @@ pub const Zone = struct {
             if (rs.rtype == types.NSEC) try nsec_list.append(a, rs.owner);
             if (rs.rtype == types.NSEC3) {
                 try nsec3_list.append(a, rs.owner);
-                if (nsec3_params == null and rs.rdata.len > 0) nsec3_params = nsec3.paramsFromRdata(rs.rdata[0]);
+                if (rs.rdata.len > 0) {
+                    if (nsec3.paramsFromRdata(rs.rdata[0])) |p| {
+                        if (nsec3_params) |*cur| {
+                            cur.opt_out = cur.opt_out or p.opt_out;
+                        } else {
+                            nsec3_params = p;
+                        }
+                    }
+                }
             }
             if (rs.rtype == types.NSEC3PARAM and std.mem.eql(u8, rs.owner, origin_wire) and rs.rdata.len > 0) {
-                nsec3_params = nsec3.paramsFromRdata(rs.rdata[0]);
+                if (nsec3.paramsFromRdata(rs.rdata[0])) |p| {
+                    if (nsec3_params) |*cur| {
+                        cur.flags = p.flags;
+                        cur.iterations = p.iterations;
+                        cur.salt = p.salt;
+                        cur.opt_out = cur.opt_out or p.opt_out;
+                    } else {
+                        nsec3_params = p;
+                    }
+                }
             }
         }
         const nsec_names = try nsec_list.toOwnedSlice(a);
@@ -295,7 +322,8 @@ pub const Zone = struct {
         }
     }
 
-    pub fn makeWildcard(closest: []const u8, buf: *[name.max_name_len]u8) []const u8 {
+    pub fn makeWildcard(closest: []const u8, buf: *[name.max_name_len]u8) ?[]const u8 {
+        if (closest.len + 2 > name.max_name_len) return null;
         buf[0] = 1;
         buf[1] = '*';
         @memcpy(buf[2..][0..closest.len], closest);
@@ -492,7 +520,16 @@ pub fn writeFile(z: *const Zone, allocator: std.mem.Allocator, io: std.Io, path:
             try w.writeByte('\n');
         }
     }
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = aw.written() });
+    const tmp = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = aw.written() }) catch |e| {
+        std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+        return e;
+    };
+    std.Io.Dir.cwd().rename(tmp, std.Io.Dir.cwd(), path, io) catch |e| {
+        std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+        return e;
+    };
 }
 
 pub fn rrsigTypeCovered(rdata: []const u8) u16 {
@@ -515,4 +552,14 @@ test "serial arithmetic" {
     try std.testing.expect(serialGreater(0, 0xffffffff));
     try std.testing.expect(!serialGreater(1, 2));
     try std.testing.expect(!serialGreater(5, 5));
+}
+
+test "wildcard name length" {
+    var buf: [name.max_name_len]u8 = undefined;
+    var too_long: [name.max_name_len - 1]u8 = undefined;
+    @memset(&too_long, 0);
+    try std.testing.expect(Zone.makeWildcard(&too_long, &buf) == null);
+    var ok: [name.max_name_len - 2]u8 = undefined;
+    @memset(&ok, 0);
+    try std.testing.expect(Zone.makeWildcard(&ok, &buf) != null);
 }

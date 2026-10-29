@@ -21,6 +21,7 @@ pub const journal = @import("zone/journal.zig");
 pub const transfer = @import("zone/transfer.zig");
 pub const openssl = @import("dnssec/openssl.zig");
 pub const dnssec_sign = @import("dnssec/sign.zig");
+pub const keydir = @import("dnssec/keydir.zig");
 pub const queryset = @import("server/queryset.zig");
 pub const query = @import("server/query.zig");
 pub const acl = @import("server/acl.zig");
@@ -47,6 +48,7 @@ test {
     _ = transfer;
     _ = openssl;
     _ = dnssec_sign;
+    _ = keydir;
     _ = queryset;
     _ = query;
     _ = acl;

@@ -11,6 +11,7 @@ const types = @import("../dns/types.zig");
 const message = @import("../dns/message.zig");
 const rdata = @import("../dns/rdata.zig");
 const zone = @import("../zone/zone.zig");
+const tsig = @import("../dns/tsig.zig");
 
 pub const Primary = struct {
     addr: Io.net.IpAddress,
@@ -38,6 +39,7 @@ pub fn fetch(
     class: u16,
     primary: Primary,
     current: ?*const zone.Zone,
+    key: ?*const tsig.Key,
 ) !Result {
     var tmp = std.heap.ArenaAllocator.init(backing);
     defer tmp.deinit();
@@ -59,7 +61,13 @@ pub fn fetch(
         const soa = try soaWithSerial(a, z.soaRdata(), z.serial);
         try b.addRecord(.authority, origin.slice(), types.SOA, class, z.soa.ttl, soa);
     }
-    const query = b.finish();
+    var query: []const u8 = b.finish();
+    var request_mac: []const u8 = &.{};
+    if (key) |k| {
+        const signed = try tsig.appendRequest(a, &qbuf, query.len, k, h.id);
+        query = qbuf[0..signed.len];
+        request_mac = try a.dupe(u8, signed.mac[0..signed.mac_len]);
+    }
     try writeAll(&stream, io, query);
 
     var records: std.ArrayList(Raw) = .empty;
@@ -68,7 +76,9 @@ pub fn fetch(
     var msg_buf: [65535]u8 = undefined;
     var msg_count: usize = 0;
     var last_was_soa = false;
+    const started = nowMs();
     while (true) {
+        if (nowMs() -| started > 600_000) return error.TransferTimeout;
         var lenbuf: [2]u8 = undefined;
         readExact(stream.socket.handle, &lenbuf, 5000) catch |e| {
             if (msg_count == 0) return e;
@@ -80,13 +90,20 @@ pub fn fetch(
             if (msg_count == 0) return e;
             break;
         };
+        if (msg_count >= 1_000_000) return error.TransferTooLarge;
         var m = try message.parse(a, msg_buf[0..len]);
         defer m.deinit(a);
         if (m.header.id != h.id) return error.BadTransfer;
         if (!m.header.qr()) return error.BadTransfer;
         if (m.header.rcode() != 0) return error.TransferRefused;
+        if (key) |k| {
+            const rr = m.tsig() orelse return error.TsigMissing;
+            const verified = try tsig.verifyResponse(a, m.raw, rr, k, request_mac, msg_count > 0);
+            request_mac = try a.dupe(u8, verified.mac);
+        }
         for (m.answers) |rr| {
             const raw = try normalizeRecord(a, m.raw, rr);
+            if (records.items.len >= 1_000_000) return error.TransferTooLarge;
             try records.append(a, raw);
         }
         msg_count += 1;
@@ -102,6 +119,7 @@ pub fn fetch(
             defer nm.deinit(a);
             for (nm.answers) |rr| {
                 const raw = try normalizeRecord(a, nm.raw, rr);
+                if (records.items.len >= 1_000_000) return error.TransferTooLarge;
                 try records.append(a, raw);
             }
             msg_count += 1;
@@ -119,7 +137,10 @@ pub fn fetch(
 
     if (records.items.len == 1 and records.items[0].rtype == types.SOA) {
         if (current) |z| {
-            if (serialOf(records.items[0].rdata) == z.serial) return .up_to_date;
+            const s = serialOf(records.items[0].rdata);
+            // A primary that is behind us (or equal) returns its current SOA;
+            // keep the newer local copy.
+            if (!zone.serialGreater(s, z.serial)) return .up_to_date;
         }
     }
 
@@ -231,24 +252,27 @@ fn normalizeRdata(a: std.mem.Allocator, msg: []const u8, rr: message.Record) ![]
     errdefer out.deinit(a);
     const rd = rr.rdata;
     const base = rr.rdata_offset;
+    const limit = base + rd.len;
     switch (rr.rtype) {
         types.NS, types.CNAME, types.PTR, types.DNAME, types.MB, types.MD, types.MF, types.MG, types.MR => {
-            _ = try appendWireName(&out, a, msg, base);
+            _ = try appendWireName(&out, a, msg, base, limit);
         },
         types.MX, types.KX, types.RT, types.AFSDB => {
             if (rd.len < 3) return error.BadTransfer;
             try out.appendSlice(a, rd[0..2]);
-            _ = try appendWireName(&out, a, msg, base + 2);
+            _ = try appendWireName(&out, a, msg, base + 2, limit);
         },
         types.SRV => {
             if (rd.len < 7) return error.BadTransfer;
             try out.appendSlice(a, rd[0..6]);
-            _ = try appendWireName(&out, a, msg, base + 6);
+            _ = try appendWireName(&out, a, msg, base + 6, limit);
         },
         types.SOA => {
-            const mname = try appendWireName(&out, a, msg, base);
-            _ = try appendWireName(&out, a, msg, base + mname);
-            try out.appendSlice(a, rd[rd.len - 20 ..]);
+            const mname = try appendWireName(&out, a, msg, base, limit);
+            const rname = try appendWireName(&out, a, msg, base + mname, limit);
+            const off = mname + rname;
+            if (off + 20 > rd.len) return error.BadTransfer;
+            try out.appendSlice(a, rd[off .. off + 20]);
         },
         types.NAPTR => {
             if (rd.len < 5) return error.BadTransfer;
@@ -257,35 +281,36 @@ fn normalizeRdata(a: std.mem.Allocator, msg: []const u8, rr: message.Record) ![]
             for (0..3) |_| {
                 if (off >= rd.len) return error.BadTransfer;
                 const l = rd[off];
+                if (off + 1 + l > rd.len) return error.BadTransfer;
                 try out.appendSlice(a, rd[off .. off + 1 + l]);
                 off += 1 + l;
             }
-            _ = try appendWireName(&out, a, msg, base + off);
+            _ = try appendWireName(&out, a, msg, base + off, limit);
         },
         types.RP, types.MINFO => {
-            const first = try appendWireName(&out, a, msg, base);
-            _ = try appendWireName(&out, a, msg, base + first);
+            const first = try appendWireName(&out, a, msg, base, limit);
+            _ = try appendWireName(&out, a, msg, base + first, limit);
         },
         types.PX => {
             if (rd.len < 3) return error.BadTransfer;
             try out.appendSlice(a, rd[0..2]);
-            const first = try appendWireName(&out, a, msg, base + 2);
-            _ = try appendWireName(&out, a, msg, base + 2 + first);
+            const first = try appendWireName(&out, a, msg, base + 2, limit);
+            _ = try appendWireName(&out, a, msg, base + 2 + first, limit);
         },
         types.RRSIG, types.SIG => {
             if (rd.len < 19) return error.BadTransfer;
             try out.appendSlice(a, rd[0..18]);
-            const first = try appendWireName(&out, a, msg, base + 18);
+            const first = try appendWireName(&out, a, msg, base + 18, limit);
             try out.appendSlice(a, rd[18 + first ..]);
         },
         types.NSEC => {
-            const first = try appendWireName(&out, a, msg, base);
+            const first = try appendWireName(&out, a, msg, base, limit);
             try out.appendSlice(a, rd[first..]);
         },
         types.SVCB, types.HTTPS => {
             if (rd.len < 3) return error.BadTransfer;
             try out.appendSlice(a, rd[0..2]);
-            const first = try appendWireName(&out, a, msg, base + 2);
+            const first = try appendWireName(&out, a, msg, base + 2, limit);
             try out.appendSlice(a, rd[2 + first ..]);
         },
         else => try out.appendSlice(a, rd),
@@ -293,9 +318,11 @@ fn normalizeRdata(a: std.mem.Allocator, msg: []const u8, rr: message.Record) ![]
     return out.toOwnedSlice(a);
 }
 
-fn appendWireName(out: *std.ArrayList(u8), a: std.mem.Allocator, msg: []const u8, off: usize) !usize {
+fn appendWireName(out: *std.ArrayList(u8), a: std.mem.Allocator, msg: []const u8, off: usize, limit: usize) !usize {
+    if (off >= limit) return error.BadTransfer;
     var n: name.Name = undefined;
     const next = try name.parseWire(msg, off, &n);
+    if (next > limit) return error.BadTransfer;
     try out.appendSlice(a, n.slice());
     return next - off; // encoded length in the original message
 }
@@ -315,12 +342,32 @@ fn serialOf(soa_rdata: []const u8) u32 {
 }
 
 fn writeAll(stream: *Io.net.Stream, io: Io, data: []const u8) !void {
-    var buf: [8192]u8 = undefined;
-    var w = stream.writer(io, &buf);
+    _ = io;
+    if (data.len > 65535) return error.MessageTooLarge;
     var prefix: [2]u8 = .{ @intCast(data.len >> 8), @intCast(data.len & 0xff) };
-    try w.interface.writeAll(&prefix);
-    try w.interface.writeAll(data);
-    try w.interface.flush();
+    try sendAll(stream.socket.handle, &prefix, 5000);
+    try sendAll(stream.socket.handle, data, 5000);
+}
+
+fn sendAll(fd: std.posix.fd_t, data: []const u8, timeout_ms: i32) !void {
+    var off: usize = 0;
+    while (off < data.len) {
+        var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 }};
+        const n = std.posix.poll(&fds, timeout_ms) catch return error.WriteFailed;
+        if (n == 0) return error.Timeout;
+        const rev = fds[0].revents;
+        if (rev & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0) return error.Closed;
+        const r = std.c.send(fd, @ptrCast(data.ptr + off), data.len - off, @intCast(std.posix.MSG.NOSIGNAL));
+        if (r < 0) return error.WriteFailed;
+        if (r == 0) return error.Closed;
+        off += @intCast(r);
+    }
+}
+
+fn nowMs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts) != 0) return 0;
+    return @as(u64, @intCast(@max(ts.sec, 0))) * 1000 + @as(u64, @intCast(@divTrunc(ts.nsec, 1_000_000)));
 }
 
 fn readExact(fd: std.posix.fd_t, buf: []u8, timeout_ms: i32) !void {

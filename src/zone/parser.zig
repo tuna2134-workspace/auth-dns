@@ -221,12 +221,7 @@ pub const Parser = struct {
                 .rdata = rdata,
                 .line = toks[0].line,
             } });
-            if (range.step > 0) {
-                if (value > std.math.maxInt(i64) - range.step) break;
-                value += range.step;
-            } else {
-                value += range.step;
-            }
+            value = std.math.add(i64, value, range.step) catch break;
         }
     }
 };
@@ -266,10 +261,15 @@ fn parseRange(s: []const u8) Error!Range {
     if (step == 0) return error.BadGenerateRange;
     if (step > 0 and stop < start) return error.BadGenerateRange;
     if (step < 0 and stop > start) return error.BadGenerateRange;
-    const span = if (step > 0) stop - start else start - stop;
-    const abs_step: i64 = @intCast(@abs(step));
-    const count: usize = @intCast(@divFloor(span, abs_step) + 1);
-    return .{ .start = start, .count = count, .step = step };
+    const span: i128 = if (step > 0)
+        @as(i128, stop) - @as(i128, start)
+    else
+        @as(i128, start) - @as(i128, stop);
+    const step_i: i128 = step;
+    const abs_step: i128 = if (step_i < 0) -step_i else step_i;
+    const count_i: i128 = @divFloor(span, abs_step) + 1;
+    if (count_i < 0 or count_i > 65536) return error.BadGenerateRange;
+    return .{ .start = start, .count = @intCast(count_i), .step = step };
 }
 
 /// Expands `$` and `${offset,width,base}` in $GENERATE fields (BIND ARM).
@@ -306,6 +306,7 @@ fn substitute(allocator: std.mem.Allocator, input: []const u8, value: i64) Error
             offset = std.fmt.parseInt(i64, off_s, 10) catch return error.BadGenerateSubstitution;
             if (parts.next()) |w| {
                 width = std.fmt.parseInt(usize, w, 10) catch return error.BadGenerateSubstitution;
+                if (width > 255) return error.BadGenerateSubstitution;
             }
             if (parts.next()) |b| {
                 if (b.len != 1) return error.BadGenerateSubstitution;
@@ -314,7 +315,7 @@ fn substitute(allocator: std.mem.Allocator, input: []const u8, value: i64) Error
             if (parts.next() != null) return error.BadGenerateSubstitution;
             i = close + 1;
         }
-        const v = value + offset;
+        const v = std.math.add(i64, value, offset) catch return error.BadGenerateSubstitution;
         if (v < 0) return error.BadGenerateSubstitution;
         try appendFormatted(&out, allocator, @intCast(v), width, base);
     }
@@ -388,4 +389,11 @@ test "include remains an AST node" {
     try std.testing.expectEqual(@as(usize, 1), a.nodes.len);
     try std.testing.expect(a.nodes[0] == .include);
     try std.testing.expectEqualStrings("sub.zone", a.nodes[0].include.path.text);
+}
+
+test "generate rejects overflow and huge width" {
+    const bad_range = "$GENERATE -9223372036854775808-9223372036854775807 host A 192.0.2.1\n";
+    try std.testing.expectError(error.BadGenerateRange, Parser.parse(std.testing.allocator, bad_range, "bad.zone"));
+    const bad_width = "$GENERATE 1-1 host${0,999999999,d} A 192.0.2.1\n";
+    try std.testing.expectError(error.BadGenerateSubstitution, Parser.parse(std.testing.allocator, bad_width, "bad.zone"));
 }

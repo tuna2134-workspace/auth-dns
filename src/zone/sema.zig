@@ -15,6 +15,7 @@ const ast = @import("ast.zig");
 const zone = @import("zone.zig");
 const openssl = @import("../dnssec/openssl.zig");
 const dnssec_sign = @import("../dnssec/sign.zig");
+const keydir = @import("../dnssec/keydir.zig");
 const nsec3 = @import("../dns/nsec3.zig");
 
 pub const Options = struct {
@@ -27,10 +28,18 @@ pub const Options = struct {
 };
 
 pub const DnssecOptions = struct {
-    key_path: []const u8,
+    /// Single-key compatibility mode.  Mutually exclusive with `key_dir`.
+    key_path: ?[]const u8 = null,
     key_flags: u16 = 257,
+    /// Directory containing ksk-*.pem and zsk-*.pem.
+    key_dir: ?[]const u8 = null,
+    auto: bool = false,
+    resign_interval: u32 = 7 * 24 * 3600,
+    zsk_lifetime: u32 = 90 * 24 * 3600,
+    propagation: u32 = 3600,
     validity: u32 = 30 * 24 * 3600,
     nsec3: bool = false,
+    nsec3_opt_out: bool = false,
     nsec3_iterations: u16 = 0,
     /// Hex text; empty means the zero-length salt.
     nsec3_salt: []const u8 = "",
@@ -93,11 +102,15 @@ fn finalize(
 ) !zone.Zone {
     const dc = options.dnssec orelse
         return zone.Zone.build(backing, l.apex, l.class, l.raw.items, l.warnings.items);
-    var unsigned = try zone.Zone.build(backing, l.apex, l.class, l.raw.items, l.warnings.items);
+    var data_recs: std.ArrayList(zone.Record) = .empty;
+    defer data_recs.deinit(tmp);
+    for (l.raw.items) |r| {
+        if (r.rtype == types.RRSIG or r.rtype == types.NSEC or r.rtype == types.NSEC3 or
+            r.rtype == types.NSEC3PARAM or r.rtype == types.DNSKEY) continue;
+        try data_recs.append(tmp, r);
+    }
+    var unsigned = try zone.Zone.build(backing, l.apex, l.class, data_recs.items, l.warnings.items);
     defer unsigned.deinit();
-    const pem = try std.Io.Dir.cwd().readFileAlloc(io, dc.key_path, tmp, .limited(1 << 20));
-    var key = try openssl.Key.loadPem(tmp, pem);
-    defer key.deinit(tmp);
     var salt: []const u8 = &.{};
     if (dc.nsec3_salt.len > 0) {
         var sb: std.ArrayList(u8) = .empty;
@@ -105,14 +118,37 @@ fn finalize(
         try text.appendHex(&sb, tmp, dc.nsec3_salt);
         salt = sb.items;
     }
-    const signed = try dnssec_sign.signZone(tmp, &unsigned, &key, .{
-        .key_flags = dc.key_flags,
+    const sign_opts: dnssec_sign.Options = .{
         .validity = dc.validity,
         .nsec3 = if (dc.nsec3) nsec3.Params{
+            .opt_out = dc.nsec3_opt_out,
             .iterations = dc.nsec3_iterations,
             .salt = salt,
         } else null,
-    });
+    };
+
+    if (dc.key_dir) |dir| {
+        var loaded = try keydir.load(tmp, io, dir, dc.auto, .{
+            .zsk_lifetime = dc.zsk_lifetime,
+            .propagation = dc.propagation,
+        });
+        defer loaded.deinit();
+        const signed = try dnssec_sign.signZone(tmp, &unsigned, loaded.specs, sign_opts);
+        return zone.Zone.build(backing, l.apex, l.class, signed, l.warnings.items);
+    }
+
+    const kp = dc.key_path orelse return error.NoKeys;
+    const pem = try std.Io.Dir.cwd().readFileAlloc(io, kp, tmp, .limited(1 << 20));
+    var key = try openssl.Key.loadPem(tmp, pem);
+    defer key.deinit(tmp);
+    var signing_keys: [2]dnssec_sign.SigningKey = undefined;
+    signing_keys[0] = .{ .key = &key, .flags = dc.key_flags };
+    var nkeys: usize = 1;
+    if (dc.key_flags != 256) {
+        signing_keys[1] = .{ .key = &key, .flags = 256 };
+        nkeys = 2;
+    }
+    const signed = try dnssec_sign.signZone(tmp, &unsigned, signing_keys[0..nkeys], sign_opts);
     return zone.Zone.build(backing, l.apex, l.class, signed, l.warnings.items);
 }
 

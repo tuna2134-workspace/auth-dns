@@ -225,4 +225,110 @@ PY
 pass "signed BADTIME and replay path"
 kill "$LAST_PID" 2>/dev/null || true
 
+
+
+# --- NSEC3 Opt-Out --------------------------------------------------------
+cp examples/example.com.zone "$TMP/optout.zone"
+start 15408 "$TMP/optout.zone" --allow-transfer any \
+    --dnssec-key testdata/test-ecdsa.pem --dnssec-nsec3 --dnssec-nsec3-opt-out \
+    --dnssec-nsec3-salt aabbccdd
+dig @127.0.0.1 -p 15408 +dnssec +noall +answer example.com NSEC3PARAM > "$TMP/optout.param"
+grep -q 'NSEC3PARAM 1 0 0 AABBCCDD' "$TMP/optout.param" || fail "opt-out NSEC3PARAM flags"
+dig @127.0.0.1 -p 15408 example.com AXFR +time=5 +tries=1 +noall +answer > "$TMP/optout.signed"
+grep -q 'NSEC3 1 1 0 AABBCCDD' "$TMP/optout.signed" || fail "opt-out NSEC3 flag"
+grep -q '7PADNQ03LR611DIDTQMUT0JPSAC5M3R6' "$TMP/optout.signed" && fail "insecure delegation was not omitted"
+dig @127.0.0.1 -p 15408 +dnssec +noall +answer example.com DNSKEY > "$TMP/optout.dnskey"
+python3 - "$TMP/optout.dnskey" "$TMP/optout.anchor" <<'PY'
+import re, sys
+line=[l for l in open(sys.argv[1]) if 'DNSKEY' in l and re.search(r'\s257\s',l)][0]
+p=line.split(); key=''.join(p[7:]); open(sys.argv[2],'w').write(f'trust-anchors {{ example.com. static-key 257 3 13 "{key}"; }};\n')
+PY
+timeout 6 delv -a "$TMP/optout.anchor" +root=example.com @127.0.0.1 -p 15408 sub.example.com DS 2>&1 \
+    | grep -q 'fully validated' || fail "opt-out DS denial validation"
+timeout 6 delv -a "$TMP/optout.anchor" +root=example.com @127.0.0.1 -p 15408 missing.example.com A 2>&1 \
+    | grep -q 'fully validated' || fail "opt-out NXDOMAIN validation"
+dnssec-verify -o example.com "$TMP/optout.signed" >/dev/null 2>&1 || fail "opt-out dnssec-verify"
+pass "NSEC3 Opt-Out chain and DS denial"
+kill "$LAST_PID" 2>/dev/null || true
+
+# --- TSIG XFR + NOTIFY ----------------------------------------------------
+mkdir -p "$TMP/tsig"
+cat > "$TMP/tsig/primary.zone" <<'ZONE'
+$TTL 60
+$ORIGIN example.com.
+@ SOA ns1 hostmaster ( 700 5 60 60 5 )
+@ NS ns1
+ns1 A 192.0.2.53
+www A 192.0.2.1
+ZONE
+cat > "$TMP/tsig/primary.conf" <<CONF
+options { listen 127.0.0.1 port 15409; directory "$TMP/tsig"; };
+key "xfr.example.com" { algorithm hmac-sha256; secret "c2VjcmV0MTIzNDU2Nzg5MA=="; };
+zone "example.com" {
+    type primary; file "primary.zone"; allow-transfer { key "xfr.example.com"; };
+    also-notify 127.0.0.1:15410 xfr.example.com;
+};
+CONF
+cat > "$TMP/tsig/secondary.conf" <<CONF
+options { listen 127.0.0.1 port 15410; directory "$TMP/tsig"; };
+key "xfr.example.com" { algorithm hmac-sha256; secret "c2VjcmV0MTIzNDU2Nzg5MA=="; };
+zone "example.com" {
+    type secondary; file "secondary.zone"; primary 127.0.0.1:15409 xfr.example.com;
+    allow-notify { key "xfr.example.com"; }; allow-transfer { none; };
+};
+CONF
+./zig-out/bin/auth-dns serve -c "$TMP/tsig/primary.conf" > "$TMP/tsig/primary.log" 2>&1 &
+TSIG_PRIMARY_PID=$!; PIDS+=($TSIG_PRIMARY_PID)
+wait_port 15409 || fail "TSIG primary did not start"
+./zig-out/bin/auth-dns serve -c "$TMP/tsig/secondary.conf" > "$TMP/tsig/secondary.log" 2>&1 &
+TSIG_SECONDARY_PID=$!; PIDS+=($TSIG_SECONDARY_PID)
+wait_port 15410 || { cat "$TMP/tsig/secondary.log" >&2; fail "TSIG secondary did not start"; }
+[[ "$(dig @127.0.0.1 -p 15410 +short example.com SOA +time=1 +tries=1 | awk '{print $3}')" == "700" ]] \
+    || fail "TSIG AXFR"
+cat > "$TMP/tsig/primary.zone" <<'ZONE'
+$TTL 60
+$ORIGIN example.com.
+@ SOA ns1 hostmaster ( 701 5 60 60 5 )
+@ NS ns1
+ns1 A 192.0.2.53
+www A 192.0.2.2
+ZONE
+kill -HUP "$TSIG_PRIMARY_PID"
+for _ in $(seq 1 50); do
+    [[ "$(dig @127.0.0.1 -p 15410 +short example.com SOA +time=1 +tries=1 | awk '{print $3}')" == "701" ]] && break
+    sleep 0.2
+done
+[[ "$(dig @127.0.0.1 -p 15410 +short www.example.com A +time=1 +tries=1)" == "192.0.2.2" ]] \
+    || fail "TSIG NOTIFY/IXFR"
+grep -q "transfer ixfr example.com.*key=xfr.example.com" "$TMP/tsig/primary.log" || fail "TSIG IXFR request"
+grep -q "NOTIFY accepted.*(TSIG)" "$TMP/tsig/secondary.log" || fail "TSIG NOTIFY"
+pass "TSIG AXFR, NOTIFY and IXFR"
+kill "$TSIG_SECONDARY_PID" "$TSIG_PRIMARY_PID" 2>/dev/null || true
+
+# --- Automatic RRSIG refresh / ZSK rollover -------------------------------
+mkdir -p "$TMP/auto/keys"
+cp examples/example.com.zone "$TMP/auto/zone"
+start 15407 "$TMP/auto/zone" --allow-transfer any \
+    --dnssec-key-dir "$TMP/auto/keys" --dnssec-auto \
+    --dnssec-resign-interval 2 --dnssec-zsk-lifetime 4 --dnssec-propagation 1
+for _ in $(seq 1 30); do
+    [[ "$(ls "$TMP/auto/keys" | wc -l)" -ge 2 ]] && break
+    sleep 0.2
+done
+[[ "$(ls "$TMP/auto/keys" | grep -c '^ksk-')" -ge 1 ]] || fail "auto KSK not generated"
+[[ "$(ls "$TMP/auto/keys" | grep -c '^zsk-')" -ge 1 ]] || fail "auto ZSK not generated"
+zsk_before="$(ls "$TMP/auto/keys" | grep '^zsk-' | tr '\n' ' ')"
+before="$(dig @127.0.0.1 -p 15407 +short example.com SOA +time=1 +tries=1 | awk '{print $3}')"
+sleep 3
+after="$(dig @127.0.0.1 -p 15407 +short example.com SOA +time=2 +tries=1 | awk '{print $3}')"
+[[ "$before" != "$after" ]] || fail "periodic RRSIG refresh did not bump the serial"
+sleep 4
+zsk_after="$(ls "$TMP/auto/keys" | grep '^zsk-' | tr '\n' ' ')"
+[[ "$zsk_before" != "$zsk_after" ]] || fail "ZSK was not rolled over"
+[[ "$(ls "$TMP/auto/keys" | grep -c '^zsk-')" -ge 1 ]] || fail "no active ZSK after rollover"
+dig @127.0.0.1 -p 15407 example.com AXFR +time=5 +tries=1 +noall +answer > "$TMP/auto/signed"
+dnssec-verify -o example.com "$TMP/auto/signed" >/dev/null 2>&1 || fail "auto-rollover zone dnssec-verify"
+pass "automatic RRSIG refresh and ZSK rollover"
+kill "$LAST_PID" 2>/dev/null || true
+
 echo "advanced tests passed"

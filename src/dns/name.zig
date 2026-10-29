@@ -295,10 +295,11 @@ pub fn parseText(text: []const u8, origin: ?*const Name) Error!Name {
             const e = text[i + 1];
             if (e >= '0' and e <= '9') {
                 if (i + 3 >= text.len) return error.InvalidText;
+                if (text[i + 2] < '0' or text[i + 2] > '9' or
+                    text[i + 3] < '0' or text[i + 3] > '9') return error.InvalidText;
                 const d0 = text[i + 1] - '0';
                 const d1 = text[i + 2] - '0';
                 const d2 = text[i + 3] - '0';
-                if (d1 > 9 or d2 > 9) return error.InvalidText;
                 const v: u16 = @as(u16, d0) * 100 + @as(u16, d1) * 10 + d2;
                 if (v > 255) return error.InvalidText;
                 if (!appendLabelByte(&n, &label_len, @intCast(v))) return error.NameTooLong;
@@ -334,14 +335,14 @@ pub fn parseText(text: []const u8, origin: ?*const Name) Error!Name {
     if (!absolute or label_len != 0) n.buf[len_pos] = @intCast(label_len);
     if (!absolute) {
         if (origin) |o| {
-            if (n.len + o.len > max_name_len) return error.NameTooLong;
+            if (@as(usize, n.len) + o.len > max_name_len) return error.NameTooLong;
             @memcpy(n.buf[n.len..][0..o.len], o.slice());
-            n.len += o.len;
+            n.len += @intCast(o.len);
         } else {
             return error.InvalidText;
         }
     } else {
-        if (n.len + 1 > max_name_len) return error.NameTooLong;
+        if (@as(usize, n.len) + 1 > max_name_len) return error.NameTooLong;
         n.buf[n.len] = 0;
         n.len += 1;
     }
@@ -350,14 +351,14 @@ pub fn parseText(text: []const u8, origin: ?*const Name) Error!Name {
 }
 
 fn reserveLabel(n: *Name) bool {
-    if (n.len + 1 > max_name_len) return false;
+    if (@as(usize, n.len) + 1 > max_name_len) return false;
     n.len += 1;
     return true;
 }
 
 fn appendLabelByte(n: *Name, label_len: *usize, c: u8) bool {
     if (label_len.* >= max_label_len) return false;
-    if (n.len + 1 > max_name_len) return false;
+    if (@as(usize, n.len) + 1 > max_name_len) return false;
     n.buf[n.len] = c;
     n.len += 1;
     label_len.* += 1;
@@ -587,6 +588,10 @@ test "compression writes a pointer for a shared suffix" {
     var out: Name = undefined;
     _ = try parseWire(msg[0..pos], after_origin, &out);
     try std.testing.expect(out.eqlIgnoreCase(&www));
+}
+
+test "reject non-decimal escaped octet" {
+    try std.testing.expectError(error.InvalidText, parseText("a\\0/0", null));
 }
 
 test "relative name with root origin" {

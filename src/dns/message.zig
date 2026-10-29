@@ -171,6 +171,12 @@ pub fn parse(allocator: std.mem.Allocator, buf: []const u8) !Message {
     const total: usize = @as(usize, h.qdcount) + h.ancount + h.nscount + h.arcount;
     if (total > 8192) return error.TooManyRecords;
     if (h.qdcount > 1024) return error.TooManyRecords;
+    // Every question needs at least root name + type/class; every RR needs at
+    // least root owner + fixed header.  Reject impossible counts before
+    // allocating multi-megabyte section arrays from a tiny packet.
+    const min_needed: usize = header_len + @as(usize, h.qdcount) * 5 +
+        (@as(usize, h.ancount) + h.nscount + h.arcount) * 11;
+    if (min_needed > buf.len) return error.Truncated;
 
     const questions = try allocator.alloc(Question, h.qdcount);
     errdefer allocator.free(questions);

@@ -1,7 +1,8 @@
 # auth-dns
 
 Zig 0.17 で実装した権威 DNS サーバです。ゾーンは BIND9 互換のマスターファイルで定義し、
-UDP/TCP の権威応答、AXFR/IXFR、EDNS(0)、TSIG、NSEC を用いた DNSSEC 署名までを実装しています。
+UDP/TCP の権威応答、AXFR/IXFR、EDNS(0)、TSIG、NSEC/NSEC3（Opt-Out 含む）
+を用いた DNSSEC 署名までを実装しています。
 暗号処理は OpenSSL 3 の **libcrypto** にのみ依存します（libssl は使いません）。
 
 ## 特徴
@@ -24,13 +25,20 @@ UDP/TCP の権威応答、AXFR/IXFR、EDNS(0)、TSIG、NSEC を用いた DNSSEC 
 - **AXFR / IXFR / セカンダリ**
   - TCP 上の複数メッセージ転送。AXFR は先頭と末尾が同一 SOA。
   - IXFR はメモリ内ジャーナル＋ディスク永続化。SIGHUP リロードで差分を生成。
-  - TSIG 使用時は各メッセージに署名し、AXFR の MAC 連鎖（RFC 8945）に対応。
+  - TSIG 使用時は各メッセージに署名し、AXFR/IXFR の MAC 連鎖（RFC 8945）に対応。
+  - セカンダリ側も XFR 要求を TSIG 署名し、応答 MAC を検証。NOTIFY も TSIG 対応。
   - セカンダリモード（AXFR/IXFR クライアント、SOA refresh、NOTIFY 受信・送信）。
+  - セカンダリからの XFR 要求と NOTIFY の TSIG 署名・検証。
 - **Dynamic Update（RFC 2136）**
   - prerequisite / add / delete / delete-RRset / delete-name、TSIG/ACL に対応。
   - 更新後に SOA シリアルを進め、ジャーナル・ゾーンファイル・DNSSEC 署名を更新。
 - **NSEC3**
   - NSEC3PARAM / NSEC3 の生成、ハッシュチェーン、NODATA/NXDOMAIN/ワイルドカードの否定証明。
+  - NSEC3 Opt-Out（insecure delegation の省略と DS 不在証明）。
+- **DNSSEC 自動運用**
+  - `dnssec-key-dir` + `dnssec-auto` で KSK/ZSK を管理。
+  - RRSIG を定期再署名（SOA シリアル更新 + IXFR + NOTIFY）。
+  - ZSK の事前公開・二重署名・伝播待ち・旧 ZSK 退役を自動化。
 - **SVCB / HTTPS**
   - `alpn` / `port` / `ipv4hint` / `ipv6hint` / `ech` / `dohpath` / `mandatory` / `no-default-alpn`。
 - **DNSSEC（オフライン署名）**
@@ -123,19 +131,40 @@ zone "example.com" {
     file "example.com.zone";
     journal "example.com.jnl";
     allow-transfer { key "xfr.example.com"; 127.0.0.1; };
-    dnssec-key "keys/example.com.pem";
+    # 単鍵モード（手動運用）:
+    # dnssec-key "keys/example.com.pem";
+    # 自動運用:
+    dnssec-key-dir "keys/example.com";
+    dnssec-auto yes;
+    dnssec-resign-interval 7d;
+    dnssec-zsk-lifetime 90d;
+    dnssec-propagation 1h;
     dnssec-flags 257;
 };
 ```
 
 - `listen` は複数指定できます。`127.0.0.1 port 15353` でも `127.0.0.1:15353` でも可。
-- `directory` は `file` / `journal` / `dnssec-key` の相対パスの基準です。
+- `directory` は `file` / `journal` / `dnssec-key` / `dnssec-key-dir` の相対パスの基準です。
+- `dnssec-auto` は `openssl` コマンドで P-256 鍵を生成します（署名自体は libcrypto）。
 - `allow-transfer` は先勝ちです。`any`, `none`, IPv4/IPv6 アドレス、CIDR、`key "name"` を指定できます。
 - デフォルトの `allow-transfer` は **none** です。
-- `type` は `primary` / `secondary`。セカンダリは `primary <addr>[:port];` と
-  `allow-notify { ... };` を指定します。プライマリは `also-notify <addr>[:port];` で
-  NOTIFY を送れます。
+- `type` は `primary` / `secondary`。セカンダリは
+  `primary <addr>[:port] [key-name];` と `allow-notify { ... };` を指定します。
+  プライマリは `also-notify <addr>[:port] [key-name];` で NOTIFY を送れます。
+  `key-name` を付けると XFR 要求/NOTIFY が TSIG 署名され、応答 MAC も検証されます。
 - `allow-update { ... };` で RFC 2136 の動的更新を許可します。
+
+セカンダリの例:
+
+```conf
+zone "example.net" {
+    type secondary;
+    file "example.net.zone";
+    primary 192.0.2.10:53 xfr.example.com;
+    allow-notify { key "xfr.example.com"; };
+    allow-transfer { none; };
+};
+```
 
 ## ゾーンファイル
 
@@ -191,8 +220,17 @@ auth-dns version
 | `--allow-transfer ACL` | 転送 ACL（カンマ区切り） |
 | `--journal-dir DIR` | IXFR ジャーナルの保存先 |
 | `--tsig NAME:ALG:SECRET` | TSIG キー（SECRET は base64） |
-| `--dnssec-key PEM` | 全ゾーンを署名する鍵 |
+| `--dnssec-key PEM` | 全ゾーンを署名する単鍵（手動） |
+| `--dnssec-key-dir DIR` | `ksk-*.pem` / `zsk-*.pem` を読み込む |
+| `--dnssec-auto` | 鍵生成・RRSIG 更新・ZSK ロールオーバーを自動化 |
+| `--dnssec-resign-interval SECONDS` | 再署名間隔（既定 7d） |
+| `--dnssec-zsk-lifetime SECONDS` | ZSK の有効期間（既定 90d） |
+| `--dnssec-propagation SECONDS` | 旧 ZSK を残す伝播待ち（既定 1h） |
 | `--dnssec-flags N` | DNSKEY フラグ（既定 257） |
+| `--dnssec-nsec3` | NSEC3 チェーンを生成 |
+| `--dnssec-nsec3-opt-out` | NSEC3 Opt-Out |
+| `--dnssec-nsec3-iterations N` | NSEC3 iterations |
+| `--dnssec-nsec3-salt HEX` | NSEC3 salt（16 進） |
 | `--max-udp-size N` | EDNS の UDP 上限（既定 1232） |
 
 ## AXFR / IXFR
@@ -266,7 +304,9 @@ DNSKEY として公開し、DNSKEY RRset を KSK、それ以外を ZSK で署名
 
 NSEC3 は `--dnssec-nsec3` / 設定の `dnssec-nsec3` で生成できます。
 `dnssec-nsec3-iterations` と `dnssec-nsec3-salt`（16 進）でパラメータを指定します。
-NSEC3 opt-out は未対応です。
+NSEC3 Opt-Out は `--dnssec-nsec3-opt-out` / `dnssec-nsec3-opt-out yes` で有効になります。
+insecure delegation は NSEC3 チェーンから省略され、DS 不在は Opt-Out フラグ付き
+NSEC3 で証明されます。
 
 ## テスト
 
@@ -284,8 +324,9 @@ zig build test
 - `dnssec-verify` によるゾーン全体の署名検証
 - SIGHUP リロード後の IXFR 差分
 
-`advanced-test.sh` は NSEC3、Dynamic Update（nsupdate）、セカンダリ/NOTIFY/IXFR、
-SVCB/HTTPS、TCP アイドル/レート制限、TSIG BADTIME を検証します。
+`advanced-test.sh` は NSEC3（Opt-Out 含む）、Dynamic Update（nsupdate）、
+セカンダリ/NOTIFY/IXFR、TSIG XFR/NOTIFY、SVCB/HTTPS、TCP アイドル/レート制限、
+TSIG BADTIME、RRSIG 自動更新/ZSK ロールオーバーを検証します。
 
 NSD をセカンダリにした相互運用テスト（Docker が必要）:
 
@@ -341,6 +382,7 @@ zone file
 | 2308 | 否定キャッシュ | SOA 同梱・負の TTL を実装 |
 | 3597 | 未知 TYPE | `\#` / `TYPE####` を実装 |
 | 4033-4035 | DNSSEC | NSEC 署名・検証を実装 |
+| 5155 | NSEC3 | NSEC3 / Opt-Out / 否定証明を実装 |
 | 4343 | 大文字小文字 | 比較は無視、質問は元のケースを保持 |
 | 4592 | ワイルドカード | closest encloser を実装 |
 | 5936 | AXFR | TCP・複数メッセージ・先頭/末尾 SOA |
@@ -348,24 +390,24 @@ zone file
 | 7766 | DNS over TCP | 2 バイト長、接続再利用、パイプライン |
 | 8482 | ANY の最小化 | 全て返す（サブセット化は未実装） |
 | 9460 | SVCB/HTTPS | 主要パラメータのテキスト形式 |
-| 8945 | TSIG | HMAC、AXFR 連鎖、成功/一部エラー |
+| 8945 | TSIG | HMAC、XFR/NOTIFY 署名・検証、BADTIME、リプレイ対策 |
 
 より詳細な RFC ノートは [docs/rfc-notes/](docs/rfc-notes/) にあります。
 
-DNSSEC 鍵更新の自動化設計（RRSIG 更新・ZSK/KSK ロールオーバー・CDS）は
+DNSSEC 鍵更新の自動化（RRSIG 更新・ZSK ロールオーバー・KSK/DS の運用）は
 [docs/dnssec-automation.md](docs/dnssec-automation.md) にまとめています。
 
 ## 制限と今後の提案
 
 - **DoT/DoH**: 現状は UDP/TCP のみ。TLS が必要なら libssl を追加し、`libcrypto` は
   そのまま使えます。`libssl` は TLS 終端のためだけに必要です。
-- **NSEC3 opt-out**: NSEC3 は生成しますが、opt-out フラグ付きの委任省略には未対応です。
-- **セカンダリの TSIG**: 受信側の TSIG 検証と応答署名は実装済みですが、セカンダリから
-  プライマリへの AXFR/IXFR リクエストは現状 NOKEY です。TSIG を付ける場合は
-  `secondary.zig` にリクエスト署名を追加してください。
-- **DNSSEC 鍵更新の自動化**: 署名更新・ZSK/KSK ロールオーバーの設計は
-  [docs/dnssec-automation.md](docs/dnssec-automation.md) にあります。サーバ内の
-  自動スケジューラと CDS/CDNSKEY は未実装です。
+- **自動鍵生成**: `dnssec-auto` は鍵生成に `openssl` コマンドを使います。
+- **NSEC3 Opt-Out のワイルドカード**: BIND 互換のため Opt-Out チェーンの全 NSEC3 に
+  flag を立てています。Opt-Out 区間で覆われるワイルドカード回答は、検証器によって
+  unsigned 扱いになることがあります（DS/NXDOMAIN の Opt-Out 証明は検証済み）。
+- **DNSSEC 鍵更新**: RRSIG 更新と ZSK ロールオーバーはサーバ内で自動化済み。
+  KSK の親 DS 更新（CDS/CDNSKEY の親処理を含む）は未実装で、レジストラ API か
+  手動操作が必要です。詳細は [docs/dnssec-automation.md](docs/dnssec-automation.md)。
 - **SVCB/HTTPS の追加パラメータ**: 主要パラメータは対応していますが、将来の
   未知キーは `keyNNNNN` として保存・転送されます。
 - **ビュー / RPZ / カタログゾーン**: 未実装です。

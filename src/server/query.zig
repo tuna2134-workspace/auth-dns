@@ -68,6 +68,9 @@ pub const Responder = struct {
         h.setRd(query.header.rd());
         h.setCd(query.header.cd());
 
+        if (query.header.qr()) {
+            return self.errorResponse(query, buf, limit, .formerr, false, 0);
+        }
         if (query.header.opcode() != 0) {
             return self.errorResponse(query, buf, limit, .notimp, false, 0);
         }
@@ -288,7 +291,10 @@ pub const Responder = struct {
         // No exact match: RFC 4592 wildcard processing.
         const ce = z.closestEncloser(qname_lower) orelse z.origin_wire;
         var wbuf: [name.max_name_len]u8 = undefined;
-        const wildcard = zone.Zone.makeWildcard(ce, &wbuf);
+        const wildcard = zone.Zone.makeWildcard(ce, &wbuf) orelse {
+            try self.addNegativeSoa(b, added, z, do, qname_lower, true);
+            return .nxdomain;
+        };
         var wildcard_exists = false;
         for (z.rrsetsAt(wildcard)) |_| wildcard_exists = true;
         if (wildcard_exists) {
@@ -448,8 +454,12 @@ pub const Responder = struct {
         if (do and z.isSigned()) {
             if (z.rrsetAt(deleg, types.DS)) |ds| {
                 try self.addRRset(b, added, z, deleg, deleg, ds, .authority, null, do);
-            } else if (z.nsec3Params() != null) {
-                try self.addNsec3Exact(b, added, z, deleg, do);
+            } else if (z.nsec3Params()) |params| {
+                if (params.opt_out) {
+                    try self.addNsec3OptOutProof(b, added, z, deleg, do);
+                } else {
+                    try self.addNsec3Exact(b, added, z, deleg, do);
+                }
             } else if (z.nsecAt(deleg)) |nsec| {
                 try self.addRRset(b, added, z, nsec.owner, nsec.owner, nsec, .authority, null, do);
             } else if (z.nsecCovering(deleg)) |nsec| {
@@ -467,10 +477,10 @@ pub const Responder = struct {
     ) !void {
         if (!isSubdomainWire(target_lower, z.origin_wire)) return;
         if (z.rrsetAt(target_lower, types.A)) |rs| {
-            try self.addRRset(b, added, z, target_lower, target_lower, rs, .additional, null, false);
+            try self.addRRset(b, added, z, rs.owner, rs.owner, rs, .additional, null, false);
         }
         if (z.rrsetAt(target_lower, types.AAAA)) |rs| {
-            try self.addRRset(b, added, z, target_lower, target_lower, rs, .additional, null, false);
+            try self.addRRset(b, added, z, rs.owner, rs.owner, rs, .additional, null, false);
         }
     }
 
@@ -489,6 +499,7 @@ pub const Responder = struct {
         if (z.nsec3Params() != null) {
             const ce = z.closestEncloser(qname_lower) orelse z.origin_wire;
             var ce_name = name.Name.init(ce) catch return;
+            try self.addNsec3Exact(b, added, z, ce_name.slice(), do);
             if (nextCloserName(qname_lower, &ce_name)) |nc| {
                 try self.addNsec3Covering(b, added, z, nc.slice(), do);
             }
@@ -540,6 +551,29 @@ pub const Responder = struct {
         }
     }
 
+    /// RFC 5155 section 7.2.4: opt-out DS absence uses an opt-out covering
+    /// NSEC3 plus the closest provable encloser.
+    fn addNsec3OptOutProof(
+        self: *const Responder,
+        b: *message.Builder,
+        added: *AddedSet,
+        z: *const zone.Zone,
+        qname_lower: []const u8,
+        do: bool,
+    ) !void {
+        try self.addNsec3Covering(b, added, z, qname_lower, do);
+        var n = name.Name.init(qname_lower) catch return;
+        while (n.parent()) |p| {
+            n = p;
+            var hn: name.Name = undefined;
+            const owner = hashOwner(z, n.slice(), &hn) orelse continue;
+            if (z.nsec3At(owner)) |rs| {
+                try self.addRRset(b, added, z, rs.owner, rs.owner, rs, .authority, null, do);
+                return;
+            }
+        }
+    }
+
     /// RFC 5155 section 7.2 denial of existence.
     fn addNsec3Proof(
         self: *const Responder,
@@ -550,6 +584,14 @@ pub const Responder = struct {
         nxdomain: bool,
         do: bool,
     ) !void {
+        const params = z.nsec3Params() orelse return;
+        if (!nxdomain and params.opt_out and z.isDelegation(qname_lower) and
+            z.rrsetAt(qname_lower, types.DS) == null)
+        {
+            try self.addNsec3OptOutProof(b, added, z, qname_lower, do);
+            return;
+        }
+
         var hn: name.Name = undefined;
         if (hashOwner(z, qname_lower, &hn)) |owner| {
             if (z.nsec3At(owner)) |rs| {
@@ -568,8 +610,9 @@ pub const Responder = struct {
 
         if (nxdomain or !z.hasName(qname_lower)) {
             var wbuf: [name.max_name_len]u8 = undefined;
-            const wildcard = zone.Zone.makeWildcard(ce_name.slice(), &wbuf);
-            try self.addNsec3Covering(b, added, z, wildcard, do);
+            if (zone.Zone.makeWildcard(ce_name.slice(), &wbuf)) |wildcard| {
+                try self.addNsec3Covering(b, added, z, wildcard, do);
+            }
         }
     }
 
@@ -593,7 +636,7 @@ pub const Responder = struct {
         }
         const ce = z.closestEncloser(qname_lower) orelse z.origin_wire;
         var wbuf: [name.max_name_len]u8 = undefined;
-        const wildcard = zone.Zone.makeWildcard(ce, &wbuf);
+        const wildcard = zone.Zone.makeWildcard(ce, &wbuf) orelse return;
         if (nxdomain) {
             if (z.nsecAt(wildcard)) |nsec| {
                 try self.addRRset(b, added, z, nsec.owner, nsec.owner, nsec, .authority, null, do);
@@ -660,10 +703,9 @@ const AddedSet = struct {
         for (s.items[0..s.len]) |k| {
             if (k.rtype == rtype and k.covered == covered and name.eqlWireIgnoreCase(k.owner, owner)) return false;
         }
-        if (s.len < s.items.len) {
-            s.items[s.len] = .{ .owner = owner, .rtype = rtype, .covered = covered };
-            s.len += 1;
-        }
+        if (s.len >= s.items.len) return false;
+        s.items[s.len] = .{ .owner = owner, .rtype = rtype, .covered = covered };
+        s.len += 1;
         return true;
     }
 };

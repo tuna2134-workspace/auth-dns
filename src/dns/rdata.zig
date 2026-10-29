@@ -239,6 +239,7 @@ pub fn parse(
             try appendSalt(&b, tokens[3].text);
             const next = try base32hexDecode(allocator, tokens[4].text);
             defer allocator.free(next);
+            if (next.len > 255) return error.RdataTooLong;
             try b.u8_(@intCast(next.len));
             try out.appendSlice(allocator, next);
             var tlist: std.ArrayList(u16) = .empty;
@@ -475,7 +476,7 @@ fn parseLoc(b: *Builder, tokens: []const text.Token) !void {
     if (i < tokens.len and isNumeric(tokens[i].text) and !isDirection(tokens[i].text)) {
         lat_sec = try parseFloatToken(tokens, &i);
     }
-    if (i >= tokens.len) return error.InvalidRdata;
+    if (i >= tokens.len or tokens[i].text.len == 0) return error.InvalidRdata;
     const ns = tokens[i].text[0];
     i += 1;
     const lon_deg = try parseFloatToken(tokens, &i);
@@ -487,7 +488,7 @@ fn parseLoc(b: *Builder, tokens: []const text.Token) !void {
     if (i < tokens.len and isNumeric(tokens[i].text) and !isDirection(tokens[i].text)) {
         lon_sec = try parseFloatToken(tokens, &i);
     }
-    if (i >= tokens.len) return error.InvalidRdata;
+    if (i >= tokens.len or tokens[i].text.len == 0) return error.InvalidRdata;
     const ew = tokens[i].text[0];
     i += 1;
     if (lat_deg < 0 or lat_deg > 90 or lat_min < 0 or lat_min > 59 or lat_sec < 0 or lat_sec >= 60) return error.InvalidRdata;
@@ -509,13 +510,21 @@ fn parseLoc(b: *Builder, tokens: []const text.Token) !void {
         vp = try parseMeters(tokens, &i);
     }
     if (i != tokens.len) return error.InvalidRdata;
+    if (!std.math.isFinite(lat_deg) or !std.math.isFinite(lat_min) or !std.math.isFinite(lat_sec) or
+        !std.math.isFinite(lon_deg) or !std.math.isFinite(lon_min) or !std.math.isFinite(lon_sec) or
+        !std.math.isFinite(alt) or !std.math.isFinite(size) or !std.math.isFinite(hp) or !std.math.isFinite(vp))
+    {
+        return error.InvalidRdata;
+    }
 
     const lat_ms: u64 = @intFromFloat((lat_deg * 3600.0 + lat_min * 60.0 + lat_sec) * 1000.0);
     const lon_ms: u64 = @intFromFloat((lon_deg * 3600.0 + lon_min * 60.0 + lon_sec) * 1000.0);
     if (lat_ms > 0x7fffffff or lon_ms > 0x7fffffff) return error.InvalidRdata;
     const lat: u32 = if (ns == 'N' or ns == 'n') @intCast(0x80000000 + lat_ms) else @intCast(0x80000000 - lat_ms);
     const lon: u32 = if (ew == 'E' or ew == 'e') @intCast(0x80000000 + lon_ms) else @intCast(0x80000000 - lon_ms);
-    const alt_cm: i64 = @intFromFloat((alt + 100000.0) * 100.0);
+    const alt_raw = (alt + 100000.0) * 100.0;
+    if (!std.math.isFinite(alt_raw)) return error.InvalidRdata;
+    const alt_cm: i64 = @intFromFloat(alt_raw);
     if (alt_cm < 0 or alt_cm > 0xffffffff) return error.InvalidRdata;
 
     try b.u8_(0);
@@ -553,7 +562,9 @@ fn parseMeters(tokens: []const text.Token, i: *usize) !f64 {
 }
 
 fn encodeLocPrecision(meters: f64) u8 {
-    var cm = @max(meters, 0.0) * 100.0;
+    if (!std.math.isFinite(meters) or meters < 0.0) return 0;
+    var cm = meters * 100.0;
+    if (!std.math.isFinite(cm)) return 0xff;
     var exp: u8 = 0;
     while (cm >= 10.0 and exp < 9) {
         cm /= 10.0;
@@ -846,6 +857,18 @@ test "parse generic rfc3597" {
     const tokens = [_]text.Token{ .{ .text = "\\#" }, .{ .text = "2" }, .{ .text = "c000" } };
     try parse(allocator, 999, &tokens, ctx, &out);
     try std.testing.expectEqualSlices(u8, &.{ 0xc0, 0x00 }, out.items);
+}
+
+test "LOC rejects NaN" {
+    const allocator = std.testing.allocator;
+    var origin = try name.parseText("example.com.", null);
+    const ctx: Context = .{ .origin = &origin };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    const tokens = [_]text.Token{
+        .{ .text = "0" }, .{ .text = "N" }, .{ .text = "0" }, .{ .text = "E" }, .{ .text = "NaN" },
+    };
+    try std.testing.expectError(error.InvalidRdata, parse(allocator, types.LOC, &tokens, ctx, &out));
 }
 
 test "parse SVCB" {

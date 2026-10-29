@@ -139,12 +139,18 @@ const ZoneBuild = struct {
     primaries: std.ArrayList(secondary.Primary) = .empty,
     allow_notify: acl.Set = .{ .entries = &.{} },
     allow_update: acl.Set = .{ .entries = &.{} },
-    also_notify: std.ArrayList(Io.net.IpAddress) = .empty,
+    also_notify: std.ArrayList(server.NotifyTarget) = .empty,
     journal: ?[]const u8 = null,
     allow: acl.Set = .{ .entries = &.{} },
     dnssec_key: ?[]const u8 = null,
+    dnssec_key_dir: ?[]const u8 = null,
+    dnssec_auto: bool = false,
+    dnssec_resign_interval: u32 = 7 * 24 * 3600,
+    dnssec_zsk_lifetime: u32 = 90 * 24 * 3600,
+    dnssec_propagation: u32 = 3600,
     dnssec_flags: u16 = 257,
     dnssec_nsec3: bool = false,
+    dnssec_nsec3_opt_out: bool = false,
     dnssec_nsec3_iterations: u16 = 0,
     dnssec_nsec3_salt: []const u8 = "",
 };
@@ -288,7 +294,12 @@ const Parser = struct {
             } else if (std.mem.eql(u8, t.text, "also-notify")) {
                 const a = p.advance();
                 const addr = Io.net.IpAddress.parseLiteral(a.text) catch return p.fail(a.line);
-                try z.also_notify.append(p.allocator, addr);
+                var key_name: ?[]const u8 = null;
+                if (p.peek().kind == .word or p.peek().kind == .string) {
+                    const k = p.advance();
+                    key_name = k.text;
+                }
+                try z.also_notify.append(p.allocator, .{ .addr = addr, .key_name = key_name });
             } else if (std.mem.eql(u8, t.text, "file")) {
                 const a = p.advance();
                 z.file = a.text;
@@ -298,12 +309,30 @@ const Parser = struct {
             } else if (std.mem.eql(u8, t.text, "dnssec-key")) {
                 const a = p.advance();
                 z.dnssec_key = a.text;
+            } else if (std.mem.eql(u8, t.text, "dnssec-key-dir")) {
+                const a = p.advance();
+                z.dnssec_key_dir = a.text;
+            } else if (std.mem.eql(u8, t.text, "dnssec-auto")) {
+                const a = p.advance();
+                z.dnssec_auto = std.ascii.eqlIgnoreCase(a.text, "yes") or std.ascii.eqlIgnoreCase(a.text, "true") or std.mem.eql(u8, a.text, "1");
+            } else if (std.mem.eql(u8, t.text, "dnssec-resign-interval")) {
+                const a = p.advance();
+                z.dnssec_resign_interval = text.parseTtl(a.text) catch return p.fail(a.line);
+            } else if (std.mem.eql(u8, t.text, "dnssec-zsk-lifetime")) {
+                const a = p.advance();
+                z.dnssec_zsk_lifetime = text.parseTtl(a.text) catch return p.fail(a.line);
+            } else if (std.mem.eql(u8, t.text, "dnssec-propagation")) {
+                const a = p.advance();
+                z.dnssec_propagation = text.parseTtl(a.text) catch return p.fail(a.line);
             } else if (std.mem.eql(u8, t.text, "dnssec-flags")) {
                 const a = p.advance();
                 z.dnssec_flags = std.fmt.parseInt(u16, a.text, 10) catch return p.fail(a.line);
             } else if (std.mem.eql(u8, t.text, "dnssec-nsec3")) {
                 const a = p.advance();
                 z.dnssec_nsec3 = std.ascii.eqlIgnoreCase(a.text, "yes") or std.ascii.eqlIgnoreCase(a.text, "true") or std.mem.eql(u8, a.text, "1");
+            } else if (std.mem.eql(u8, t.text, "dnssec-nsec3-opt-out")) {
+                const a = p.advance();
+                z.dnssec_nsec3_opt_out = std.ascii.eqlIgnoreCase(a.text, "yes") or std.ascii.eqlIgnoreCase(a.text, "true") or std.mem.eql(u8, a.text, "1");
             } else if (std.mem.eql(u8, t.text, "dnssec-nsec3-iterations")) {
                 const a = p.advance();
                 z.dnssec_nsec3_iterations = std.fmt.parseInt(u16, a.text, 10) catch return p.fail(a.line);
@@ -320,6 +349,7 @@ const Parser = struct {
         _ = p.advance();
         _ = p.maybeSemi();
         if (z.file.len == 0) return p.fail(nt.line);
+        if (z.dnssec_key != null and z.dnssec_key_dir != null) return p.fail(nt.line);
         try p.zone_list.append(p.allocator, z);
     }
 
@@ -412,6 +442,7 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Config {
         const file = try resolve(a, dir, z.file);
         const journal = if (z.journal) |j| try resolve(a, dir, j) else null;
         const key_path = if (z.dnssec_key) |k| try resolve(a, dir, k) else null;
+        const key_dir = if (z.dnssec_key_dir) |d| try resolve(a, dir, d) else null;
         try zones.append(a, .{
             .origin = z.origin,
             .file = file,
@@ -422,10 +453,16 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Config {
             .also_notify = try z.also_notify.toOwnedSlice(a),
             .journal_path = journal,
             .allow_transfer = z.allow,
-            .dnssec = if (key_path) |kp| .{
-                .key_path = kp,
+            .dnssec = if (key_path != null or z.dnssec_key_dir != null) .{
+                .key_path = key_path,
+                .key_dir = key_dir,
+                .auto = z.dnssec_auto,
+                .resign_interval = z.dnssec_resign_interval,
+                .zsk_lifetime = z.dnssec_zsk_lifetime,
+                .propagation = z.dnssec_propagation,
                 .key_flags = z.dnssec_flags,
                 .nsec3 = z.dnssec_nsec3,
+                .nsec3_opt_out = z.dnssec_nsec3_opt_out,
                 .nsec3_iterations = z.dnssec_nsec3_iterations,
                 .nsec3_salt = z.dnssec_nsec3_salt,
             } else null,

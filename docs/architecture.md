@@ -129,6 +129,8 @@
   - 未知のシリアルは AXFR にフォールバック。
 - TSIG 使用時は `tsig.appendResponse` で各メッセージに署名。
   - 1 通目はリクエスト MAC、2 通目以降は直前の応答 MAC と timers-only 変数。
+- セカンダリ側は `tsig.appendRequest` で要求を署名し、`tsig.verifyResponse` で
+  1 通目（要求 MAC）と 2 通目以降（直前の応答 MAC + timers-only）を検証。
 
 ### ジャーナル (`src/zone/journal.zig`)
 
@@ -144,12 +146,13 @@
 
 ### セカンダリ (`src/server/secondary.zig`)
 
-- プライマリへ TCP で IXFR（初回は AXFR）を要求。
+- プライマリへ TCP で IXFR（初回は AXFR）を要求。TSIG 設定時は要求を署名し、
+  応答の MAC（AXFR/IXFR の連鎖を含む）を検証。
 - 応答メッセージを解析し、RDATA 内の圧縮名を非圧縮の正規形に直して
   `Zone.build` で不変 Zone を構築。
 - IXFR は「現在 SOA → 旧 SOA → 削除 → 新 SOA → 追加」の列として適用し、
   最後に新しい SOA を置く。
-- `refresh` 間隔で SOA を確認し、NOTIFY 受信時は即時リフレッシュ。
+- `refresh` 間隔で SOA を確認し、TSIG 付き NOTIFY を受信したら即時リフレッシュ。
 - 取得したゾーンはマスターファイルに書き戻し、再起動時に再利用。
 
 ### Dynamic Update (`src/server/update.zig`)
@@ -161,6 +164,15 @@
 - 成功時は `journal.diff` で差分をジャーナルへ追加し、ゾーンファイルを
   アトミックに置き換え、`also-notify` へ NOTIFY を送る。
 - 更新は排他ロックで直列化。
+
+### DNSSEC 鍵管理 (`src/dnssec/keydir.zig`)
+
+- `ksk-<unix>.pem` / `zsk-<unix>.pem` を列挙し、KSK(257)/ZSK(256) として読み込む。
+- 複数 ZSK がある間は全 ZSK で署名（DNSKEY にも全部公開）。
+- `dnssec-auto` 時は `openssl genpkey` で不足鍵を生成し、ZSK の寿命・伝播待ちを
+  ファイル時刻から判断して追加・削除する。
+- サーバの 1 秒タイマーが鍵変更を検出すると、SOA シリアルを進めて再署名し、
+  ジャーナル・ゾーンファイル・NOTIFY を更新する。
 
 ### レート制限 (`src/server/ratelimit.zig`)
 
@@ -181,9 +193,11 @@
 - SIGHUP:
   - 1 秒ごとにフラグを確認し、ゾーンを再読み込み。
 - 1 秒ごとにセカンダリの refresh 期限を確認し、AXFR/IXFR を実行。
-- NOTIFY（opcode 4）は `allow-notify` ACL を確認して refresh を起動。
-  プライマリは `also-notify` へ NOTIFY を送信。
+- NOTIFY（opcode 4）は TSIG を検証し、`allow-notify` ACL を確認して refresh を起動。
+  プライマリは `also-notify` へ NOTIFY を送信（ターゲットごとに TSIG 署名可能）。
 - Dynamic Update（opcode 5）は `allow-update` ACL を確認して適用。
+- DNSSEC 自動運用: 1 秒ごとに鍵ディレクトリを確認し、RRSIG 更新期限または
+  ZSK ロールオーバーがあれば再署名・シリアル更新・NOTIFY を行う。
   - シリアルが増えていれば差分をジャーナルに追加して保存。
   - 同一シリアルで内容が変わった場合はジャーナルを破棄（IXFR で表現不能）。
 
@@ -204,6 +218,8 @@
   - DNSKEY（KSK 257 + ZSK 256、同じ公開鍵）を追加。
   - 通常は NSEC チェーン（ENT には NSEC を作らない）。
   - `nsec3` 指定時は NSEC3PARAM + NSEC3 チェーン（ENT もハッシュ化、bitmap は空）。
+  - `nsec3-opt-out` 時は insecure delegation を省略し、BIND 互換で全 NSEC3 に
+    Opt-Out フラグを設定。DS 不在は covering NSEC3 + closest provable encloser で証明。
   - 各 RRset の canonical データを作り RRSIG を生成。
   - 委任点の NS は署名しない（親側は DS と NSEC のみ）。
 - DS 生成は `ds` サブコマンドで行い、親ゾーンに登録できる。

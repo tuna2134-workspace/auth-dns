@@ -40,36 +40,61 @@ pub const Options = struct {
 /// list.  Owner/RDATA slices of the original records reference `z`; the zone
 /// must outlive the returned array (it is consumed by Zone.build, which
 /// copies).
+pub const SigningKey = struct {
+    key: *const openssl.Key,
+    flags: u16,
+};
+
+const KeyInfo = struct {
+    key: *const openssl.Key,
+    flags: u16,
+    rdata: []const u8,
+    tag: u16,
+};
+
 pub fn signZone(
     allocator: std.mem.Allocator,
     z: *const zone.Zone,
-    key: *const openssl.Key,
+    keys: []const SigningKey,
     opts: Options,
 ) ![]zone.Record {
+    if (keys.len == 0) return error.NoKeys;
     const now: u32 = @truncate(@as(u64, @bitCast(time(null))));
     const inception = opts.inception orelse (now -% opts.inception_skew);
     const expiration = opts.expiration orelse (now +% opts.validity);
     const dnskey_ttl = opts.dnskey_ttl orelse z.soa.ttl;
     const nsec_ttl = opts.nsec_ttl orelse z.negative_ttl;
 
-    const dnskey_rdata = try openssl.dnskeyRdata(allocator, opts.key_flags, key);
-    const ksk_tag = openssl.keyTag(dnskey_rdata);
-    // A zone needs a ZSK for ordinary data and (for conventional validators)
-    // a self-signed KSK.  With a single private key we publish the same public
-    // key under both flags, sign the DNSKEY RRset with the KSK and everything
-    // else with the ZSK.
-    const zsk_rdata = if (opts.key_flags != 256)
-        try openssl.dnskeyRdata(allocator, 256, key)
-    else
-        dnskey_rdata;
-    const zsk_tag = openssl.keyTag(zsk_rdata);
+    var infos = try allocator.alloc(KeyInfo, keys.len);
+    defer allocator.free(infos);
+    for (keys, 0..) |k, i| {
+        const rd = try openssl.dnskeyRdata(allocator, k.flags, k.key);
+        infos[i] = .{
+            .key = k.key,
+            .flags = k.flags,
+            .rdata = rd,
+            .tag = openssl.keyTag(rd),
+        };
+    }
+
+    var ksk_idx: std.ArrayList(usize) = .empty;
+    defer ksk_idx.deinit(allocator);
+    var zsk_idx: std.ArrayList(usize) = .empty;
+    defer zsk_idx.deinit(allocator);
+    for (infos, 0..) |k, i| {
+        if (k.flags & 0x8000 != 0) {
+            try ksk_idx.append(allocator, i);
+        } else {
+            try zsk_idx.append(allocator, i);
+        }
+    }
+    if (ksk_idx.items.len == 0) for (infos, 0..) |_, i| try ksk_idx.append(allocator, i);
+    if (zsk_idx.items.len == 0) for (infos, 0..) |_, i| try zsk_idx.append(allocator, i);
 
     var out: std.ArrayList(zone.Record) = .empty;
     errdefer out.deinit(allocator);
 
-    // 1. Original records (excluding any pre-existing DNSSEC records, which a
-    //    zone file should not normally contain when online/offline signing is
-    //    enabled).
+    // 1. Original records.
     for (z.allRRsets()) |*rs| {
         for (rs.rdata) |rd| {
             try out.append(allocator, .{
@@ -82,31 +107,25 @@ pub fn signZone(
         }
     }
 
-    // 2. DNSKEY(s) at the apex.
-    try out.append(allocator, .{
-        .owner = z.origin_wire,
-        .rtype = types.DNSKEY,
-        .class = z.class,
-        .ttl = dnskey_ttl,
-        .rdata = dnskey_rdata,
-    });
-    if (zsk_rdata.ptr != dnskey_rdata.ptr) {
+    // 2. DNSKEY RRset (all published keys).
+    for (infos) |k| {
         try out.append(allocator, .{
             .owner = z.origin_wire,
             .rtype = types.DNSKEY,
             .class = z.class,
             .ttl = dnskey_ttl,
-            .rdata = zsk_rdata,
+            .rdata = k.rdata,
         });
     }
+    var dnskeys = try allocator.alloc([]const u8, infos.len);
+    defer allocator.free(dnskeys);
+    for (infos, 0..) |k, i| dnskeys[i] = k.rdata;
 
-    // 3. NSEC or NSEC3 denial chain over authoritative names.
+    // 3. NSEC or NSEC3 denial chain.
     var nameset: std.StringHashMapUnmanaged(void) = .{};
     defer nameset.deinit(allocator);
     for (z.allRRsets()) |*rs| {
-        if (isAuthoritativeRRset(z, rs.owner, rs.rtype)) {
-            try nameset.put(allocator, rs.owner, {});
-        }
+        if (isAuthoritativeRRset(z, rs.owner, rs.rtype)) try nameset.put(allocator, rs.owner, {});
     }
     try nameset.put(allocator, z.origin_wire, {});
     var sorted_list: std.ArrayList([]const u8) = .empty;
@@ -117,14 +136,10 @@ pub fn signZone(
     defer allocator.free(sorted);
     std.mem.sort([]const u8, sorted, {}, nameLess);
 
-    if (opts.nsec3) |params| {
-        var entries: std.ArrayList(Nsec3Entry) = .empty;
-        defer entries.deinit(allocator);
-        var nsec3_records: std.ArrayList(zone.Record) = .empty;
-        defer nsec3_records.deinit(allocator);
-        var param_records: std.ArrayList(zone.Record) = .empty;
-        defer param_records.deinit(allocator);
+    var denial: std.ArrayList(zone.Record) = .empty;
+    defer denial.deinit(allocator);
 
+    if (opts.nsec3) |params| {
         var param_rdata: std.ArrayList(u8) = .empty;
         defer param_rdata.deinit(allocator);
         try param_rdata.append(allocator, 1);
@@ -133,15 +148,13 @@ pub fn signZone(
         if (params.salt.len > 255) return error.InvalidSoa;
         try param_rdata.append(allocator, @intCast(params.salt.len));
         try param_rdata.appendSlice(allocator, params.salt);
-        const p_rec: zone.Record = .{
+        try denial.append(allocator, .{
             .owner = z.origin_wire,
             .rtype = types.NSEC3PARAM,
             .class = z.class,
             .ttl = nsec_ttl,
             .rdata = try param_rdata.toOwnedSlice(allocator),
-        };
-        try param_records.append(allocator, p_rec);
-        try out.append(allocator, p_rec);
+        });
 
         var n3owners: std.ArrayList([]const u8) = .empty;
         defer n3owners.deinit(allocator);
@@ -150,6 +163,8 @@ pub fn signZone(
             const nm = mentry.key_ptr.*;
             if (z.findDelegation(nm)) |deleg| {
                 if (!std.mem.eql(u8, nm, deleg)) continue;
+                // RFC 5155 Opt-Out: omit insecure delegations from the chain.
+                if (params.opt_out and z.rrsetAt(nm, types.DS) == null) continue;
             }
             try n3owners.append(allocator, nm);
         }
@@ -157,6 +172,8 @@ pub fn signZone(
         defer allocator.free(n3sorted);
         std.mem.sort([]const u8, n3sorted, {}, nameLess);
 
+        var entries: std.ArrayList(Nsec3Entry) = .empty;
+        defer entries.deinit(allocator);
         for (n3sorted) |owner| {
             var h: [nsec3.hash_len]u8 = undefined;
             try nsec3.hashName(owner, params, &h);
@@ -175,7 +192,10 @@ pub fn signZone(
             var rd: std.ArrayList(u8) = .empty;
             defer rd.deinit(allocator);
             try rd.append(allocator, 1);
-            try rd.append(allocator, params.flags);
+            // BIND-compatible: every NSEC3 in an opt-out chain carries the
+            // Opt-Out flag.  This is conservative and lets validators handle
+            // any omitted delegation.
+            try rd.append(allocator, if (params.opt_out) 1 else params.flags);
             try appendU16(&rd, allocator, params.iterations);
             try rd.append(allocator, @intCast(params.salt.len));
             try rd.appendSlice(allocator, params.salt);
@@ -185,30 +205,15 @@ pub fn signZone(
             defer tlist.deinit(allocator);
             try nsec3Types(z, e.original, &tlist, allocator);
             try rdata.encodeTypeBitmap(&rd, allocator, tlist.items);
-            const rec: zone.Record = .{
+            try denial.append(allocator, .{
                 .owner = e.hashed_owner,
                 .rtype = types.NSEC3,
                 .class = z.class,
                 .ttl = nsec_ttl,
                 .rdata = try rd.toOwnedSlice(allocator),
-            };
-            try nsec3_records.append(allocator, rec);
-            try out.append(allocator, rec);
-        }
-
-        for (nsec3_records.items) |*nr| {
-            const rdatas = [_][]const u8{nr.rdata};
-            const sig = try makeRrsig(allocator, z, nr.owner, types.NSEC3, nr.ttl, &rdatas, key, zsk_tag, inception, expiration);
-            try out.append(allocator, sig);
-        }
-        for (param_records.items) |*pr| {
-            const rdatas = [_][]const u8{pr.rdata};
-            const sig = try makeRrsig(allocator, z, pr.owner, types.NSEC3PARAM, pr.ttl, &rdatas, key, zsk_tag, inception, expiration);
-            try out.append(allocator, sig);
+            });
         }
     } else {
-        var nsec_records: std.ArrayList(zone.Record) = .empty;
-        defer nsec_records.deinit(allocator);
         for (sorted, 0..) |owner, i| {
             const next = sorted[(i + 1) % sorted.len];
             var rd: std.ArrayList(u8) = .empty;
@@ -226,35 +231,42 @@ pub fn signZone(
             try tlist.append(allocator, types.NSEC);
             if (std.mem.eql(u8, owner, z.origin_wire)) try tlist.append(allocator, types.DNSKEY);
             try rdata.encodeTypeBitmap(&rd, allocator, tlist.items);
-            try nsec_records.append(allocator, .{
+            try denial.append(allocator, .{
                 .owner = owner,
                 .rtype = types.NSEC,
                 .class = z.class,
                 .ttl = nsec_ttl,
                 .rdata = try rd.toOwnedSlice(allocator),
             });
-            try out.append(allocator, nsec_records.items[nsec_records.items.len - 1]);
         }
+    }
+    for (denial.items) |r| try out.append(allocator, r);
 
-        for (nsec_records.items) |*nr| {
-            const rdatas = [_][]const u8{nr.rdata};
-            const sig = try makeRrsig(allocator, z, nr.owner, types.NSEC, nr.ttl, &rdatas, key, zsk_tag, inception, expiration);
+    // 4. Sign ordinary RRsets with every ZSK.
+    for (z.allRRsets()) |*rs| {
+        if (!isSignableRRset(z, rs.owner, rs.rtype)) continue;
+        for (zsk_idx.items) |ki| {
+            const k = infos[ki];
+            const sig = try makeRrsig(allocator, z, rs.owner, rs.rtype, rs.ttl, rs.rdata, k.key, k.tag, inception, expiration);
             try out.append(allocator, sig);
         }
     }
 
-    // 4. Sign every authoritative RRset, including DNSKEY.
-    for (z.allRRsets()) |*rs| {
-        if (!isSignableRRset(z, rs.owner, rs.rtype)) continue;
-        const sig = try makeRrsig(allocator, z, rs.owner, rs.rtype, rs.ttl, rs.rdata, key, zsk_tag, inception, expiration);
+    // 5. Sign the DNSKEY RRset with every KSK.
+    for (ksk_idx.items) |ki| {
+        const k = infos[ki];
+        const sig = try makeRrsig(allocator, z, z.origin_wire, types.DNSKEY, dnskey_ttl, dnskeys, k.key, k.tag, inception, expiration);
         try out.append(allocator, sig);
     }
-    // DNSKEY RRset, signed by the KSK.
-    {
-        var rdatas: [2][]const u8 = .{ dnskey_rdata, zsk_rdata };
-        const n: usize = if (zsk_rdata.ptr != dnskey_rdata.ptr) 2 else 1;
-        const sig = try makeRrsig(allocator, z, z.origin_wire, types.DNSKEY, dnskey_ttl, rdatas[0..n], key, ksk_tag, inception, expiration);
-        try out.append(allocator, sig);
+
+    // 6. Sign the denial records with every ZSK.
+    for (denial.items) |*nr| {
+        const rdatas = [_][]const u8{nr.rdata};
+        for (zsk_idx.items) |ki| {
+            const k = infos[ki];
+            const sig = try makeRrsig(allocator, z, nr.owner, nr.rtype, nr.ttl, &rdatas, k.key, k.tag, inception, expiration);
+            try out.append(allocator, sig);
+        }
     }
 
     return out.toOwnedSlice(allocator);
@@ -282,11 +294,8 @@ fn nsec3Types(z: *const zone.Zone, owner: []const u8, tlist: *std.ArrayList(u16)
         any = true;
         if (rs.rtype == types.DS) has_ds = true;
     }
-    // Empty non-terminals have an NSEC3 with an empty type bitmap.  NSEC3 is
-    // not a type at the original owner, so it must not appear here.
     if (!any) return;
     if (deleg) {
-        // The parent signs DS, not the delegation NS RRset.
         if (has_ds) try tlist.append(allocator, types.RRSIG);
         return;
     }
@@ -416,7 +425,11 @@ test "sign a small zone" {
     var key = try openssl.Key.loadPem(allocator, pem);
     defer key.deinit(allocator);
 
-    const recs = try signZone(allocator, &z, &key, .{});
+    const keys = [_]SigningKey{
+        .{ .key = &key, .flags = 257 },
+        .{ .key = &key, .flags = 256 },
+    };
+    const recs = try signZone(allocator, &z, &keys, .{});
     defer {
         for (recs) |r| {
             if (r.rtype == types.DNSKEY or r.rtype == types.RRSIG or r.rtype == types.NSEC) {

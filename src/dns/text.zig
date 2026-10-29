@@ -125,10 +125,11 @@ pub fn decodeString(text: []const u8, out: *std.ArrayList(u8), allocator: std.me
         const e = text[i + 1];
         if (e >= '0' and e <= '9') {
             if (i + 3 >= text.len) return error.InvalidEscape;
+            if (text[i + 2] < '0' or text[i + 2] > '9' or
+                text[i + 3] < '0' or text[i + 3] > '9') return error.InvalidEscape;
             const d0 = text[i + 1] - '0';
             const d1 = text[i + 2] - '0';
             const d2 = text[i + 3] - '0';
-            if (d1 > 9 or d2 > 9) return error.InvalidEscape;
             const v: u16 = @as(u16, d0) * 100 + @as(u16, d1) * 10 + d2;
             if (v > 255) return error.InvalidEscape;
             try out.append(allocator, @intCast(v));
@@ -232,6 +233,12 @@ test "DNSSEC time parsing" {
     try std.testing.expectEqual(@as(u32, 0), try parseTime("19700101000000"));
     try std.testing.expectEqual(@as(u32, 1700000000), try parseTime("20231114221320"));
     try std.testing.expectEqual(@as(u32, 12345), try parseTime("12345"));
+}
+
+test "reject non-decimal escaped octet" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try std.testing.expectError(error.InvalidEscape, decodeString("\\0/0", &out, std.testing.allocator));
 }
 
 test "escape decoding" {
