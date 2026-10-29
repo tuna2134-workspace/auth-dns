@@ -325,6 +325,9 @@ zone file
 
 より詳細な RFC ノートは [docs/rfc-notes/](docs/rfc-notes/) にあります。
 
+DNSSEC 鍵更新の自動化設計（RRSIG 更新・ZSK/KSK ロールオーバー・CDS）は
+[docs/dnssec-automation.md](docs/dnssec-automation.md) にまとめています。
+
 ## 制限と今後の提案
 
 - **DoT/DoH**: 現状は UDP/TCP のみ。TLS が必要なら libssl を追加し、`libcrypto` は

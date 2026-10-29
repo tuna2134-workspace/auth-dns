@@ -200,9 +200,22 @@ pub const Server = struct {
             };
             const old = &self.entries[i].zone;
             if (newz.serial == old.serial) {
-                // Same serial but possibly different content: IXFR cannot
-                // represent this, so invalidate the journal.
-                self.entries[i].journal.clear();
+                // A periodic re-sign changes only RRSIGs; keep the IXFR
+                // history in that case.  Any real data change with the same
+                // serial is not representable by IXFR, so invalidate it.
+                var d = journal_mod.diff(self.gpa, old, &newz) catch {
+                    self.entries[i].journal.clear();
+                    continue;
+                };
+                var only_sigs = true;
+                for (d.removed) |r| if (r.rtype != types.RRSIG) {
+                    only_sigs = false;
+                };
+                for (d.added) |r| if (r.rtype != types.RRSIG) {
+                    only_sigs = false;
+                };
+                d.deinit(self.gpa);
+                if (!only_sigs) self.entries[i].journal.clear();
             } else if (zone.serialGreater(newz.serial, old.serial)) {
                 var delta = journal_mod.diff(self.gpa, old, &newz) catch |e| {
                     std.debug.print("reload diff: {t}\n", .{e});

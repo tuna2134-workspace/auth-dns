@@ -309,6 +309,9 @@ pub fn parse(
             defer allocator.free(hex);
             try text.appendHex(out, allocator, hex);
         },
+        types.SVCB, types.HTTPS => {
+            try parseSvc(&b, tokens);
+        },
         types.CSYNC => {
             if (tokens.len < 3) return error.WrongTokenCount;
             try b.u32_(try text.parseU32(tokens[0].text));
@@ -326,6 +329,139 @@ pub fn parse(
         },
     }
     if (out.items.len > 65535) return error.RdataTooLong;
+}
+
+const SvcParam = struct {
+    key: u16,
+    value: []u8,
+};
+
+fn parseSvc(b: *Builder, tokens: []const text.Token) !void {
+    if (tokens.len < 2) return error.WrongTokenCount;
+    try b.u16_(try text.parseU16(tokens[0].text));
+    try b.name_(tokens[1]);
+
+    var params: std.ArrayList(SvcParam) = .empty;
+    defer {
+        for (params.items) |p| b.allocator.free(p.value);
+        params.deinit(b.allocator);
+    }
+
+    var i: usize = 2;
+    while (i < tokens.len) : (i += 1) {
+        const tok = tokens[i];
+        var key_text: []const u8 = tok.text;
+        var raw_value: []const u8 = "";
+        var has_value = false;
+        if (std.mem.indexOfScalar(u8, tok.text, '=')) |eq| {
+            key_text = tok.text[0..eq];
+            raw_value = tok.text[eq + 1 ..];
+            has_value = true;
+            if (raw_value.len == 0 and i + 1 < tokens.len and tokens[i + 1].quoted) {
+                i += 1;
+                raw_value = tokens[i].text;
+            }
+        }
+        const key = svcParamKey(key_text) orelse return error.InvalidRdata;
+        for (params.items) |p| if (p.key == key) return error.InvalidRdata;
+
+        var value: std.ArrayList(u8) = .empty;
+        errdefer value.deinit(b.allocator);
+        switch (key) {
+            0 => { // mandatory
+                if (!has_value) return error.InvalidRdata;
+                var it = std.mem.splitScalar(u8, raw_value, ',');
+                while (it.next()) |part| {
+                    const t = std.mem.trim(u8, part, " \t");
+                    if (t.len == 0) return error.InvalidRdata;
+                    const k = svcParamKey(t) orelse return error.InvalidRdata;
+                    try text.appendU16(&value, b.allocator, k);
+                }
+            },
+            1 => { // alpn
+                if (!has_value) return error.InvalidRdata;
+                var it = std.mem.splitScalar(u8, raw_value, ',');
+                while (it.next()) |part| {
+                    const t = std.mem.trim(u8, part, " \t");
+                    if (t.len == 0 or t.len > 255) return error.InvalidRdata;
+                    try value.append(b.allocator, @intCast(t.len));
+                    try value.appendSlice(b.allocator, t);
+                }
+            },
+            2 => { // no-default-alpn
+                if (has_value and raw_value.len != 0) return error.InvalidRdata;
+            },
+            3 => { // port
+                if (!has_value) return error.InvalidRdata;
+                try text.appendU16(&value, b.allocator, try text.parseU16(raw_value));
+            },
+            4 => { // ipv4hint
+                if (!has_value) return error.InvalidRdata;
+                var it = std.mem.splitScalar(u8, raw_value, ',');
+                while (it.next()) |part| {
+                    const t = std.mem.trim(u8, part, " \t");
+                    const ip = std.Io.net.Ip4Address.parse(t, 0) catch return error.InvalidRdata;
+                    try value.appendSlice(b.allocator, &ip.bytes);
+                }
+            },
+            5 => { // ech
+                if (!has_value) return error.InvalidRdata;
+                const decoded = try text.decodedAlloc(b.allocator, raw_value);
+                defer b.allocator.free(decoded);
+                try text.appendBase64(&value, b.allocator, decoded);
+            },
+            6 => { // ipv6hint
+                if (!has_value) return error.InvalidRdata;
+                var it = std.mem.splitScalar(u8, raw_value, ',');
+                while (it.next()) |part| {
+                    const t = std.mem.trim(u8, part, " \t");
+                    const ip = std.Io.net.Ip6Address.parse(t, 0) catch return error.InvalidRdata;
+                    try value.appendSlice(b.allocator, &ip.bytes);
+                }
+            },
+            7 => { // dohpath
+                if (!has_value) return error.InvalidRdata;
+                const decoded = try text.decodedAlloc(b.allocator, raw_value);
+                defer b.allocator.free(decoded);
+                try value.appendSlice(b.allocator, decoded);
+            },
+            else => {
+                if (has_value) {
+                    const decoded = try text.decodedAlloc(b.allocator, raw_value);
+                    defer b.allocator.free(decoded);
+                    try value.appendSlice(b.allocator, decoded);
+                }
+            },
+        }
+        try params.append(b.allocator, .{ .key = key, .value = try value.toOwnedSlice(b.allocator) });
+    }
+
+    std.mem.sort(SvcParam, params.items, {}, svcParamLess);
+    for (params.items) |p| {
+        if (p.value.len > 65535) return error.RdataTooLong;
+        try b.u16_(p.key);
+        try b.u16_(@intCast(p.value.len));
+        try b.out.appendSlice(b.allocator, p.value);
+    }
+}
+
+fn svcParamLess(_: void, a: SvcParam, b: SvcParam) bool {
+    return a.key < b.key;
+}
+
+fn svcParamKey(text_: []const u8) ?u16 {
+    if (std.ascii.eqlIgnoreCase(text_, "mandatory")) return 0;
+    if (std.ascii.eqlIgnoreCase(text_, "alpn")) return 1;
+    if (std.ascii.eqlIgnoreCase(text_, "no-default-alpn")) return 2;
+    if (std.ascii.eqlIgnoreCase(text_, "port")) return 3;
+    if (std.ascii.eqlIgnoreCase(text_, "ipv4hint")) return 4;
+    if (std.ascii.eqlIgnoreCase(text_, "ech")) return 5;
+    if (std.ascii.eqlIgnoreCase(text_, "ipv6hint")) return 6;
+    if (std.ascii.eqlIgnoreCase(text_, "dohpath")) return 7;
+    if (std.ascii.startsWithIgnoreCase(text_, "key")) {
+        return std.fmt.parseInt(u16, text_[3..], 10) catch null;
+    }
+    return null;
 }
 
 fn parseLoc(b: *Builder, tokens: []const text.Token) !void {
@@ -708,6 +844,29 @@ test "parse generic rfc3597" {
     const tokens = [_]text.Token{ .{ .text = "\\#" }, .{ .text = "2" }, .{ .text = "c000" } };
     try parse(allocator, 999, &tokens, ctx, &out);
     try std.testing.expectEqualSlices(u8, &.{ 0xc0, 0x00 }, out.items);
+}
+
+test "parse SVCB" {
+    const allocator = std.testing.allocator;
+    var origin = try name.parseText("example.com.", null);
+    const ctx: Context = .{ .origin = &origin };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    const tokens = [_]text.Token{
+        .{ .text = "1" },
+        .{ .text = "svc" },
+        .{ .text = "alpn=h2,h3" },
+        .{ .text = "port=8443" },
+        .{ .text = "ipv4hint=192.0.2.1" },
+    };
+    try parse(allocator, types.SVCB, &tokens, ctx, &out);
+    // priority 1, target svc.example.com, then params sorted: alpn(1), port(3), ipv4hint(4)
+    try std.testing.expectEqual(@as(u8, 0), out.items[0]);
+    try std.testing.expectEqual(@as(u8, 1), out.items[1]);
+    try std.testing.expectEqual(@as(u8, 3), out.items[2]); // svc label
+    try std.testing.expectEqual(@as(u8, 's'), out.items[3]);
+    // ... name follows; just ensure it encoded
+    try std.testing.expect(out.items.len > 20);
 }
 
 test "parse LOC" {

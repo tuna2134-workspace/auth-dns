@@ -149,5 +149,15 @@ echo "$IXFR" | grep -q '192.0.2.200' || fail "IXFR addition"
 echo "$IXFR" | grep -q '192.0.2.2' || fail "IXFR modification"
 pass "IXFR after reload"
 
+# A SIGHUP without data changes re-signs the zone.  RRSIG-only changes must
+# not destroy the existing IXFR history.
+kill -HUP "$PID"
+sleep 2.2
+IXFR2=$(dig @127.0.0.1 -p "$PORT" -y hmac-sha256:xfr.example.com:c2VjcmV0MTIzNDU2Nzg5MA== \
+    example.com IXFR=2024010101 +time=5 +tries=1 +noall +answer)
+echo "$IXFR2" | grep -q '2024010102' || fail "IXFR history lost after re-sign"
+echo "$IXFR2" | grep -q '192.0.2.200' || fail "IXFR delta lost after re-sign"
+pass "IXFR history preserved across re-sign"
+
 echo
 echo "all integration tests passed"
