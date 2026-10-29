@@ -1,0 +1,10 @@
+.zig-cache/
+.zig-global-cache/
+zig-out/
+*.jnl
+*.log
+server.pid
+.docker/
+.nsd-test.*/
+integration/nsd/db/
+integration/nsd/zones/
