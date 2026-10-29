@@ -79,7 +79,10 @@ pub fn generate(allocator: std.mem.Allocator, io: Io, dir: []const u8, role: Rol
         std.Io.Dir.cwd().deleteFile(io, path) catch {};
         return error.KeyGenerationFailed;
     };
-    defer allocator.free(pem);
+    defer {
+        @memset(pem, 0);
+        allocator.free(pem);
+    }
 
     var file = std.Io.Dir.cwd().createFile(io, path, .{
         .exclusive = true,

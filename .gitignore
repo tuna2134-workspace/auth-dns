@@ -9,3 +9,6 @@ server.pid
 integration/nsd/db/
 integration/nsd/zones/
 .advanced-test.*/
+integration/*/keys/
+integration/*.pem
+integration/*-test/
